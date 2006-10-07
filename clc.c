@@ -13,20 +13,49 @@
 /* telnet info */
 typedef enum { TELNET_TEXT, TELNET_IAC, TELNET_DO, TELNET_DONT, TELNET_WILL, TELNET_WONT, TELNET_SUB, TELNET_SUBIAC } telnet_state_t;
 
+#define TELNET_MAX_SUB (1024*8)
+#define TELNET_MAX_ZMP_ARGS 32
+
+#define TELNET_FLAG_ZMP (1<<0)
+#define TELNET_FLAGS_DEFAULT 0
+
 struct TELNET {
 	telnet_state_t state;
 	int sock;
+	char sub_buf[TELNET_MAX_SUB];
+	size_t sub_size;
+	char flags;
 } telnet;
+
+/* ZMP setup */
+
+typedef void (*zmp_cb_t)(int argc, char** argv);
+
+struct ZMP {
+	const char* name;
+	zmp_cb_t cb;
+	struct ZMP* next;
+};
+struct ZMP* zmp_list;
+
+/* ZMP handlers */
+
+static void zmp_check (int argc, char** argv);
 
 /* terminal output parser */
 typedef enum { TERM_ASCII, TERM_ESC, TERM_ESCRUN } term_state_t;
 
 #define TERM_MAX_ESC 16
 
+#define TERM_FLAG_ECHO (1<<0)
+#define TERM_FLAG_GA (1<<1)
+#define TERM_FLAGS_DEFAULT (TERM_FLAG_ECHO)
+
 struct TERMINAL {
 	term_state_t state;
 	int esc_buf[TERM_MAX_ESC];
 	size_t esc_cnt;
+	char flags;
 } terminal;
 
 /* line buffer */
@@ -43,6 +72,54 @@ static void cleanup (void) {
 	endwin();
 }
 
+/* force-send bytes to telnet server */
+static void do_send (const char* bytes, size_t len) {
+	int ret;
+	while (len > 0) {
+		ret = send(telnet.sock, bytes, len, 0);
+		if (ret == -1) {
+			if (ret != EAGAIN && ret != EINTR) {
+				endwin();
+				fprintf(stderr, "send() failed: %s\n", strerror(errno));
+				exit(1);
+			}
+			continue;
+		} else if (ret == 0) {
+			endwin();
+			printf("Disconnected.\n");
+			exit(0);
+		} else {
+			bytes += ret;
+			len -= ret;
+		}
+	}
+}
+
+/* force-send bytes to telnet server, escaping IAC */
+static void do_send_esc (const char* bytes, size_t len) {
+	size_t last = 0;
+	size_t i;
+	char esc[2] = { IAC, IAC };
+	for (i = 0; i < len; ++i) {
+		/* found an IAC?  dump text so far, send esc */
+		if ((unsigned char)bytes[i] == IAC) {
+			if (i > last)
+				do_send(bytes + last, i - last);
+			do_send(esc, 2);
+			last = i + 1;
+		}
+	}
+	/* send remainder */
+	if (i > last)
+		do_send(bytes + last, i - last);
+}
+
+/* send a telnet option */
+static void telnet_send_opt(int type, int opt) {
+	char bytes[3] = { IAC, type, opt };
+	do_send(bytes, 3);
+}
+
 /* process user input */
 static void on_key (int key) {
 	size_t len = strlen(user_line);
@@ -50,23 +127,34 @@ static void on_key (int key) {
 	/* send */
 	if (key == '\n' || key == '\r') {
 		user_line[len] = '\n';
-		int ret = send(telnet.sock, user_line, len+1, 0);
-		if (ret == -1) {
-			endwin();
-			fprintf(stderr, "send() failed: %s\n", strerror(errno));
-			exit(1);
-		}
-		waddnstr(win_main, user_line, len+1);
+		/* send line to server */
+		do_send_esc(user_line, len+1);
+		/* echo output */
+		if (terminal.flags & TERM_FLAG_ECHO)
+			waddnstr(win_main, user_line, len+1);
+		/* reset input */
 		user_line[0] = 0;
-		wclear(win_input);
+	}
+
+	/* backspace; remove last character */
+	else if (key == KEY_BACKSPACE) {
+		if (len > 0)
+			user_line[len-1] = 0;
 	}
 	
-	/* attempt to add; don't do it we're full */
-	else if (len <= sizeof(user_line) - 1) {
-		user_line[len] = key;
-		user_line[len+1] = 0;
-		waddch(win_input, key);
+	/* attempt to add */
+	else if (isprint(key)) {
+		/* only if we're not full */
+		if (len <= sizeof(user_line) - 1) {
+			user_line[len] = key;
+			user_line[len+1] = 0;
+		}
 	}
+
+	/* draw input */
+	wclear(win_input);
+	if (terminal.flags & TERM_FLAG_ECHO)
+		mvwaddstr(win_input, 0, 0, user_line);
 }
 
 /* process text into virtual terminal */
@@ -113,6 +201,64 @@ static void on_text (const char* text, size_t len) {
 	}
 }
 
+/* process ZMP chunk in subrequest */
+static void on_zmp (const char* data, size_t len) {
+	const char* argv[TELNET_MAX_ZMP_ARGS];
+	size_t argc;
+
+	/* initial arg */
+	argc = 1;
+	argv[0] = data;
+
+	/* find additional args */
+	const char* next = argv[0] + strlen(argv[0]);
+	endwin();
+	while (next - data != len) {
+		/* fail on overflow */
+		if (argc == TELNET_MAX_ZMP_ARGS)
+			return;
+
+		/* store it */
+		argv[argc] = next + 1;
+		next = argv[argc] + strlen(argv[argc]);
+		++argc;
+	}
+
+	/* find the command */
+	struct ZMP* zmp = zmp_list;
+	while (zmp != NULL) {
+		/* if match, execute and end */
+		if (strcmp(zmp->name, argv[0]) == 0) {
+			zmp->cb(argc, (char**)argv);
+			break;
+		}
+		zmp = zmp->next;
+	}
+}
+
+/* process telnet subrequest */
+static void on_subreq (void) {
+	/* must have at least one byte */
+	if (telnet.sub_size == 0)
+		return;
+
+	switch (telnet.sub_buf[0]) {
+		/* ZMP command */
+		case 93:
+			/* ZMP not turned on?  ignore */
+			if ((telnet.flags & TELNET_FLAG_ZMP) == 0)
+				return;
+
+			/* sanity check */
+			if (telnet.sub_size < 3 || !isalpha(telnet.sub_buf[1]) || telnet.sub_buf[telnet.sub_size-1] != 0)
+				return;
+
+			/* invoke ZMP */
+			on_zmp(&telnet.sub_buf[1], telnet.sub_size - 1);
+			break;
+	}
+}
+
 /* process input from telnet */
 static void on_input (const char* data, size_t len) {
 	size_t i;
@@ -140,8 +286,10 @@ static void on_input (const char* data, size_t len) {
 				else if ((unsigned char)data[i] == WONT)
 					telnet.state = TELNET_WONT;
 				/* sub-request */
-				else if ((unsigned char)data[i] == SB)
+				else if ((unsigned char)data[i] == SB) {
 					telnet.state = TELNET_SUB;
+					telnet.sub_size = 0;
+				}
 				/* something else; error, just print it */
 				else {
 					char buf[64];
@@ -151,23 +299,56 @@ static void on_input (const char* data, size_t len) {
 				}
 				break;
 			case TELNET_DO:
+				telnet.state = TELNET_TEXT;
+				break;
 			case TELNET_DONT:
+				telnet.state = TELNET_TEXT;
+				break;
 			case TELNET_WILL:
+				/* turn off echo */
+				if ((unsigned char)data[i] == TELOPT_ECHO) {
+					terminal.flags &= ~TERM_FLAG_ECHO;
+					telnet_send_opt(DO, TELOPT_ECHO);
+				}
+				/* enable ZMP */
+				else if ((unsigned char)data[i] == 93) {
+					telnet.flags |= TELNET_FLAG_ZMP;
+					telnet_send_opt(DO, 93);
+				}
+				telnet.state = TELNET_TEXT;
+				break;
 			case TELNET_WONT:
+				/* turn on echo */
+				if ((unsigned char)data[i] == TELOPT_ECHO)
+					terminal.flags |= TERM_FLAG_ECHO;
 				telnet.state = TELNET_TEXT;
 				break;
 			case TELNET_SUB:
 				/* IAC escape */
 				if ((unsigned char)data[i] == IAC)
 					telnet.state = TELNET_SUBIAC;
+				/* overflow; error out and reset to TEXT mode */
+				else if (telnet.sub_size == TELNET_MAX_SUB)
+					telnet.state = TELNET_TEXT;
+				/* another byte */
+				else
+					telnet.sub_buf[telnet.sub_size++] = data[i];
 				break;
 			case TELNET_SUBIAC:
 				/* IAC IAC escape */
-				if ((unsigned char)data[i] == IAC)
-					{}	
+				if ((unsigned char)data[i] == IAC) {
+					/* overflow; error out and reset to TEXT mode */
+					if (telnet.sub_size == TELNET_MAX_SUB)
+						telnet.state = TELNET_TEXT;
+					/* add the IAC byte */
+					else
+						telnet.sub_buf[telnet.sub_size++] = data[i];
+				}
 				/* end, process */
-				else if ((unsigned char)data[i] == SE)
+				else if ((unsigned char)data[i] == SE) {
 					telnet.state = TELNET_TEXT;
+					on_subreq();
+				}
 				/* something else; error */
 				else
 					telnet.state = TELNET_TEXT;
@@ -175,8 +356,78 @@ static void on_input (const char* data, size_t len) {
 		}
 	}
 	char buf[64];
-	snprintf(buf, sizeof(buf), "Input: %d", len);
+	snprintf(buf, sizeof(buf), "Input: %d %d", len, telnet.flags);
+	wclear(win_banner);
 	mvwaddstr(win_banner, 0, 0, buf);
+}
+
+/* register a ZMP handler */
+static void zmp_register (const char* name, zmp_cb_t cb) {
+	struct ZMP* zmp;
+
+	zmp = (struct ZMP*)malloc(sizeof(struct ZMP));
+	if (zmp == NULL) {
+		endwin();
+		fprintf(stderr, "malloc() failed: %s\n", strerror(errno));
+		exit(1);
+	}
+	zmp->next = zmp_list;
+	zmp->name = name;
+	zmp->cb = cb;
+	zmp_list = zmp;
+}
+
+/* check if a given command/package is supported */
+static int zmp_do_check (const char* name) {
+	size_t len = strlen(name);
+
+	/* empty name?  no, not supported... */
+	if (len == 0)
+		return 0;
+
+	/* package check */
+	if (name[len-1] == '.') {
+		struct ZMP* zmp = zmp_list;
+		while (zmp != NULL) {
+			if (strncmp(zmp->name, name, len) == 0)
+				return 1;
+			zmp = zmp->next;
+		}
+	}
+	/* command check */
+	else {
+		struct ZMP* zmp = zmp_list;
+		while (zmp != NULL) {
+			if (strcmp(zmp->name, name) == 0)
+				return 1;
+			zmp = zmp->next;
+		}
+	}
+
+	/* no match found */
+	return 0;
+}
+
+/* send a ZMP command */
+static void zmp_send (int argc, char** argv) {
+	/* no args... ignore */
+	if (argc < 1)
+		return;
+
+	/* send header */
+	char hdr[3] = { IAC, SB, 93 };
+	do_send(hdr, 3);
+
+	/* send args */
+	size_t i;
+	for (i = 0; i < argc; ++i) {
+		/* remember to include NUL byte */
+		do_send_esc(argv[i], strlen(argv[i]) + 1);
+	}
+
+	/* send footer */
+	char ftr[2] = { IAC, SE };
+	do_send(ftr, 2);
 }
 
 int main (int argc, char** argv) {
@@ -185,9 +436,15 @@ int main (int argc, char** argv) {
 
 	/* set terminal defaults */
 	terminal.state = TERM_ASCII;
+	terminal.flags = TERM_FLAGS_DEFAULT;
 
 	/* set telnet defaults */
 	telnet.state = TELNET_TEXT;
+	telnet.flags = TELNET_FLAGS_DEFAULT;
+
+	/* register ZMP handlers */
+	zmp_list = NULL;
+	zmp_register("zmp.check", zmp_check);
 
 	/* connect to server */
 	struct sockaddr_in sockaddr;
@@ -289,4 +546,17 @@ int main (int argc, char** argv) {
 	}
 
 	return 0;
+}
+
+/*** ZMP handlers ***/
+
+static void zmp_check (int argc, char** argv) {
+	if (argc != 2) return;
+	if (zmp_do_check(argv[1])) {
+		char* sargv[2] = { "zmp.support", argv[1] };
+		zmp_send(2, sargv);
+	} else {
+		char* sargv[2] = { "zmp.no-support", argv[1] };
+		zmp_send(2, sargv);
+	}
 }
