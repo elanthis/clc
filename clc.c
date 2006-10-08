@@ -46,9 +46,9 @@ static void zmp_check (int argc, char** argv);
 typedef enum { TERM_ASCII, TERM_ESC, TERM_ESCRUN } term_state_t;
 
 #define TERM_MAX_ESC 16
+#define TERM_COLOR_DEFAULT 9
 
 #define TERM_FLAG_ECHO (1<<0)
-#define TERM_FLAG_GA (1<<1)
 #define TERM_FLAGS_DEFAULT (TERM_FLAG_ECHO)
 
 struct TERMINAL {
@@ -56,6 +56,7 @@ struct TERMINAL {
 	int esc_buf[TERM_MAX_ESC];
 	size_t esc_cnt;
 	char flags;
+	int color;
 } terminal;
 
 /* line buffer */
@@ -130,8 +131,11 @@ static void on_key (int key) {
 		/* send line to server */
 		do_send_esc(user_line, len+1);
 		/* echo output */
-		if (terminal.flags & TERM_FLAG_ECHO)
+		if (terminal.flags & TERM_FLAG_ECHO) {
+			wattron(win_main, COLOR_PAIR(COLOR_YELLOW));
 			waddnstr(win_main, user_line, len+1);
+			wattron(win_main, COLOR_PAIR(terminal.color));
+		}
 		/* reset input */
 		user_line[0] = 0;
 	}
@@ -155,6 +159,28 @@ static void on_key (int key) {
 	wclear(win_input);
 	if (terminal.flags & TERM_FLAG_ECHO)
 		mvwaddstr(win_input, 0, 0, user_line);
+}
+
+/* perform a terminal escape */
+static void on_term_esc(char cmd) {
+	size_t i;
+
+	switch (cmd) {
+		/* mode set: */
+		case 'm':
+			for (i = 0; i < terminal.esc_cnt; ++i) {
+				/* default */
+				if (terminal.esc_buf[i] == 0) {
+					terminal.color = TERM_COLOR_DEFAULT;
+					wattron(win_main, COLOR_PAIR(terminal.color));
+				}
+				/* color */
+				else if (terminal.esc_buf[i] >= 31 && terminal.esc_buf[i] <= 37) {
+					terminal.color = terminal.esc_buf[i] - 30;
+					wattron(win_main, COLOR_PAIR(terminal.color));
+				}
+			}
+	}
 }
 
 /* process text into virtual terminal */
@@ -184,16 +210,21 @@ static void on_text (const char* text, size_t len) {
 			case TERM_ESCRUN:
 				/* number, add to option */
 				if (isdigit(text[i])) {
-					terminal.esc_buf[terminal.esc_cnt] *= 10;
-					terminal.esc_buf[terminal.esc_cnt] += text[i] - '0';
+					if (terminal.esc_cnt == 0)
+						terminal.esc_cnt = 1;
+					terminal.esc_buf[terminal.esc_cnt-1] *= 10;
+					terminal.esc_buf[terminal.esc_cnt-1] += text[i] - '0';
 				}
 				/* semi-colon, go to next option */
 				else if (text[i] == ';') {
-					if (terminal.esc_cnt < TERM_MAX_ESC-1)
+					if (terminal.esc_cnt < TERM_MAX_ESC) {
 						terminal.esc_cnt++;
+						terminal.esc_buf[terminal.esc_cnt-1] = 0;
+					}
 				}
 				/* anything-else; perform option */
 				else {
+					on_term_esc(text[i]);
 					terminal.state = TERM_ASCII;
 				}
 				break;
@@ -355,10 +386,6 @@ static void on_input (const char* data, size_t len) {
 				break;
 		}
 	}
-	char buf[64];
-	snprintf(buf, sizeof(buf), "Input: %d %d", len, telnet.flags);
-	wclear(win_banner);
-	mvwaddstr(win_banner, 0, 0, buf);
 }
 
 /* register a ZMP handler */
@@ -437,6 +464,7 @@ int main (int argc, char** argv) {
 	/* set terminal defaults */
 	terminal.state = TERM_ASCII;
 	terminal.flags = TERM_FLAGS_DEFAULT;
+	terminal.color = TERM_COLOR_DEFAULT;
 
 	/* set telnet defaults */
 	telnet.state = TELNET_TEXT;
@@ -477,6 +505,7 @@ int main (int argc, char** argv) {
 
 	/* configure curses */
 	initscr();
+	start_color();
 	nonl();
 	cbreak();
 	noecho();
@@ -490,6 +519,24 @@ int main (int argc, char** argv) {
 
 	nodelay(win_input, TRUE);
 	keypad(win_input, TRUE);
+
+	init_pair(COLOR_RED, COLOR_RED, COLOR_BLACK);
+	init_pair(COLOR_BLUE, COLOR_BLUE, COLOR_BLACK);
+	init_pair(COLOR_GREEN, COLOR_GREEN, COLOR_BLACK);
+	init_pair(COLOR_CYAN, COLOR_CYAN, COLOR_BLACK);
+	init_pair(COLOR_MAGENTA, COLOR_MAGENTA, COLOR_BLACK);
+	init_pair(COLOR_YELLOW, COLOR_YELLOW, COLOR_BLACK);
+	init_pair(COLOR_WHITE, COLOR_WHITE, COLOR_BLACK);
+
+	init_pair(TERM_COLOR_DEFAULT, COLOR_WHITE, COLOR_BLACK);
+	wbkgd(win_main, COLOR_PAIR(TERM_COLOR_DEFAULT));
+	wclear(win_main);
+	init_pair(10, COLOR_WHITE, COLOR_BLUE);
+	wbkgd(win_banner, COLOR_PAIR(10));
+	wclear(win_main);
+	init_pair(11, COLOR_YELLOW, COLOR_BLACK);
+	wbkgd(win_input, COLOR_PAIR(11));
+	wclear(win_input);
 
 	/* initialize user line buffer */
 	user_line[0] = 0;
