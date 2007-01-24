@@ -1,3 +1,5 @@
+#include <termio.h>
+#include <signal.h>
 #include <ncurses.h>
 #include <stdlib.h>
 #include <sys/poll.h>
@@ -26,6 +28,11 @@ struct TELNET {
 	size_t sub_size;
 	char flags;
 } telnet;
+
+/* functions */
+static void telnet_send_cmd(int cmd);
+static void telnet_send_opt(int type, int opt);
+static void do_send_esc (const char* bytes, size_t len);
 
 /* ZMP setup */
 
@@ -60,17 +67,74 @@ struct TERMINAL {
 } terminal;
 
 /* line buffer */
-char user_line[1024];
+static char user_line[1024];
+
+/* banner buffer */
+static char banner[1024];
 
 /* windows */
 static WINDOW* win_main;
 static WINDOW* win_input;
 static WINDOW* win_banner;
 
+/* last interrupt */
+volatile int have_sigwinch;
+volatile int have_sigint;
+
 /* cleanup function */
 static void cleanup (void) {
 	/* cleanup curses */
 	endwin();
+}
+
+/* handle signals */
+static void handle_signal (int sig) {
+	switch (sig) {
+		case SIGWINCH:
+			have_sigwinch = 1;
+			break;
+		case SIGINT:
+			have_sigint = 1;
+			break;
+	}
+}
+
+/* paint banner */
+static void paint_banner (void) {
+	wclear(win_banner);
+	mvwaddstr(win_banner, 0, 0, banner);
+}
+
+/* redraw all windows */
+static void redraw_display (void) {
+	/* get size */
+	struct winsize ws;
+	if (ioctl(0, TIOCGWINSZ, &ws))
+		return;
+
+	/* resize */
+	resizeterm(ws.ws_row, ws.ws_col);
+	mvwin(win_input, LINES-1, 0);
+	wresize(win_input, 1, COLS);
+	mvwin(win_banner, LINES-2, 0);
+	wresize(win_banner, 1, COLS);
+	wresize(win_main, LINES-2, COLS);
+
+	/* update */
+	paint_banner();
+
+	/* send telnet size update */
+	telnet_send_opt(SB, TELOPT_NAWS);
+	unsigned short w = htons(COLS), h = htons(LINES);
+	do_send_esc((char*)&w, 2);
+	do_send_esc((char*)&h, 2);
+	telnet_send_cmd(SE);
+
+	/* refresh */
+	wnoutrefresh(win_main);
+	wnoutrefresh(win_banner);
+	wnoutrefresh(win_input);
+	doupdate();
 }
 
 /* force-send bytes to telnet server */
@@ -115,6 +179,12 @@ static void do_send_esc (const char* bytes, size_t len) {
 		do_send(bytes + last, i - last);
 }
 
+/* send a telnet cmd */
+static void telnet_send_cmd(int cmd) {
+	char bytes[2] = { IAC, cmd };
+	do_send(bytes, 2);
+}
+
 /* send a telnet option */
 static void telnet_send_opt(int type, int opt) {
 	char bytes[3] = { IAC, type, opt };
@@ -126,7 +196,7 @@ static void on_key (int key) {
 	size_t len = strlen(user_line);
 
 	/* send */
-	if (key == '\n' || key == '\r') {
+	if (key == '\n' || key == '\r' || key == KEY_ENTER) {
 		user_line[len] = '\n';
 		/* send line to server */
 		do_send_esc(user_line, len+1);
@@ -147,7 +217,7 @@ static void on_key (int key) {
 	}
 	
 	/* attempt to add */
-	else if (isprint(key)) {
+	else if (key < KEY_MIN && isprint(key)) {
 		/* only if we're not full */
 		if (len <= sizeof(user_line) - 1) {
 			user_line[len] = key;
@@ -180,6 +250,13 @@ static void on_term_esc(char cmd) {
 					wattron(win_main, COLOR_PAIR(terminal.color));
 				}
 			}
+			break;
+		/* clear */
+		case 'J':
+			/* clear whole screen */
+			if (terminal.esc_buf[0] == 2)
+				wclear(win_main);
+			break;
 	}
 }
 
@@ -330,6 +407,11 @@ static void on_input (const char* data, size_t len) {
 				}
 				break;
 			case TELNET_DO:
+				switch (data[i]) {
+					case TELOPT_NAWS:
+						telnet_send_opt(WILL, TELOPT_NAWS);
+						break;
+				}
 				telnet.state = TELNET_TEXT;
 				break;
 			case TELNET_DONT:
@@ -503,6 +585,9 @@ int main (int argc, char** argv) {
 		return 1;
 	}
 
+	/* set initial banner */
+	snprintf(banner, sizeof(banner), "localhost:4545 - CLC");
+
 	/* configure curses */
 	initscr();
 	start_color();
@@ -510,9 +595,9 @@ int main (int argc, char** argv) {
 	cbreak();
 	noecho();
 
-	win_main = newwin(22, 80, 0, 0);
-	win_banner = newwin(1, 80, 22, 0);
-	win_input = newwin(1, 80, 23, 0);
+	win_main = newwin(LINES-2, COLS, 0, 0);
+	win_banner = newwin(1, COLS, LINES-2, 0);
+	win_input = newwin(1, COLS, LINES-1, 0);
 
 	idlok(win_main, TRUE);
 	scrollok(win_main, TRUE);
@@ -533,10 +618,19 @@ int main (int argc, char** argv) {
 	wclear(win_main);
 	init_pair(10, COLOR_WHITE, COLOR_BLUE);
 	wbkgd(win_banner, COLOR_PAIR(10));
-	wclear(win_main);
+	wclear(win_banner);
 	init_pair(11, COLOR_YELLOW, COLOR_BLACK);
 	wbkgd(win_input, COLOR_PAIR(11));
 	wclear(win_input);
+
+	redraw_display();
+
+	/* set signal handlers */
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = handle_signal;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGWINCH, &sa, NULL);
 
 	/* initialize user line buffer */
 	user_line[0] = 0;
@@ -557,6 +651,17 @@ int main (int argc, char** argv) {
 				fprintf(stderr, "poll() failed: %s\n", strerror(errno));
 				return 1;
 			}
+		}
+
+		/* resize event? */
+		if (have_sigwinch) {
+			have_sigwinch = 0;
+			redraw_display();
+		}
+
+		/* escape? */
+		if (have_sigint) {
+			exit(0);
 		}
 
 		/* input? */
