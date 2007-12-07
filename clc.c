@@ -614,6 +614,18 @@ static void websock_on_recv(const char* data, size_t len) {
 					snprintf(banner, sizeof(banner), "%.*s", (int)websock.msg_size - 1, &websock.msg[1]);
 					paint_banner();
 					break;
+				/* clear screen */
+				case 'C':
+					wclear(win_main);
+					break;
+				/* password mode */
+				case 'p':
+					/* data must be 1 for on, 0 for off, else no effect */
+					if (websock.msg_size == 2 && websock.msg[1] == '1')
+						terminal.flags &= ~TERM_FLAG_ECHO;
+					else if (websock.msg_size == 2 && websock.msg[1] == '0')
+						terminal.flags |= TERM_FLAG_ECHO;
+					break;
 			}
 
 			/* reset buffer */
