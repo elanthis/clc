@@ -44,12 +44,12 @@ static void telnet_on_resize(int w, int h);
 static void telnet_send_cmd(int cmd);
 static void telnet_send_opt(int type, int opt);
 static void telnet_send_esc(const char* bytes, size_t len);
-static void telnet_do_subreq (void);
+static void telnet_do_subreq(void);
 
 /* websock protocol */
 #define WEBSOCK_MAX_MSG 2048
 
-struct WEBSOCK {
+static struct WEBSOCK {
 	char msg[WEBSOCK_MAX_MSG];
 	size_t msg_size;
 } websock;
@@ -61,7 +61,7 @@ static void websock_on_resize(int w, int h);
 /* protocol handler */
 typedef enum { PROTOCOL_TELNET, PROTOCOL_WEBSOCK } protocol_type_t;
 
-struct PROTOCOL {
+static struct PROTOCOL {
 	protocol_type_t type;
 
 	void (*on_line)(const char* line, size_t len);
@@ -80,7 +80,7 @@ typedef enum { TERM_ASCII, TERM_ESC, TERM_ESCRUN } term_state_t;
 #define TERM_FLAG_ECHO (1<<0)
 #define TERM_FLAGS_DEFAULT (TERM_FLAG_ECHO)
 
-struct TERMINAL {
+static struct TERMINAL {
 	term_state_t state;
 	int esc_buf[TERM_MAX_ESC];
 	size_t esc_cnt;
@@ -88,11 +88,29 @@ struct TERMINAL {
 	int color;
 } terminal;
 
+/* edit buffer */
+
+#define EDITBUF_MAX 1024
+
+static struct EDITBUF {
+	char buf[EDITBUF_MAX];
+	size_t size;
+	size_t pos;
+} editbuf;
+
+static void editbuf_set(const char*);
+static void editbuf_insert(int);
+static void editbuf_bs();
+static void editbuf_del();
+static void editbuf_eraseword();
+static void editbuf_curleft();
+static void editbuf_curright();
+static void editbuf_display();
+static void editbuf_home();
+static void editbuf_end();
+
 /* running flag; when 0, exit main loop */
 static int running = 1;
-
-/* line buffer */
-static char user_line[1024];
 
 /* banner buffer */
 static char banner[1024];
@@ -108,6 +126,10 @@ volatile int have_sigint = 0;
 
 /* server socket */
 static int sock;
+
+/* core functions */
+static void on_text_plain (const char* text, size_t len);
+static void on_text_ansi (const char* text, size_t len);
 
 /* ======= CORE ======= */
 
@@ -127,6 +149,108 @@ static void handle_signal (int sig) {
 			have_sigint = 1;
 			break;
 	}
+}
+
+/* set the edit buffer to contain the given text */
+static void editbuf_set (const char* text) {
+	snprintf(editbuf.buf, EDITBUF_MAX, "%s", text);
+	editbuf.pos = editbuf.size = strlen(text);
+}
+
+/* insert/replace a character at the current location */
+static void editbuf_insert (int ch) {
+	/* ensure we have space */
+	if (editbuf.size == EDITBUF_MAX)
+		return;
+
+	/* if we're at the end, just append the character */
+	if (editbuf.pos == editbuf.size) {
+		editbuf.buf[editbuf.pos] = ch;
+		editbuf.pos = ++editbuf.size;
+		return;
+	}
+
+	/* move data, insert character */
+	memmove(editbuf.buf + editbuf.pos + 1, editbuf.buf + editbuf.pos, editbuf.size - editbuf.pos);
+	editbuf.buf[editbuf.pos] = ch;
+	++editbuf.pos;
+	++editbuf.size;
+}
+
+/* delete character one position to the left */
+static void editbuf_bs () {
+	/* if we're at the beginning, do nothing */
+	if (editbuf.pos == 0)
+		return;
+
+	/* if we're at the end, just decrement pos and size */
+	if (editbuf.pos == editbuf.size) {
+		editbuf.pos = --editbuf.size;
+		return;
+	}
+
+	/* chop out the previous character */
+	memmove(editbuf.buf + editbuf.pos - 1, editbuf.buf + editbuf.pos, editbuf.size - editbuf.pos);
+	--editbuf.pos;
+	--editbuf.size;
+}
+
+/* delete word under cursor */
+static void editbuf_del () {
+	/* if we're at the end, do nothing */
+	if (editbuf.pos == editbuf.size)
+		return;
+
+	/* if we're at the end, just decrement pos and size */
+	if (editbuf.pos == editbuf.size - 1) {
+		--editbuf.pos;
+		--editbuf.size;
+		return;
+	}
+
+	/* chop out the current character */
+	memmove(editbuf.buf + editbuf.pos, editbuf.buf + editbuf.pos + 1, editbuf.size - editbuf.pos - 1);
+	--editbuf.size;
+}
+
+/* delete prior word */
+static void editbuf_eraseword () {
+}
+
+/* move to home position */
+static void editbuf_home () {
+	editbuf.pos = 0;
+}
+
+/* move to end position */
+static void editbuf_end () {
+	editbuf.pos = editbuf.size;
+}
+
+/* move cursor left */
+static void editbuf_curleft () {
+	if (editbuf.pos > 0)
+		--editbuf.pos;
+}
+
+/* move cursor right */
+static void editbuf_curright () {
+	if (editbuf.pos < editbuf.size)
+		++editbuf.pos;
+}
+
+/* display the edit buffer in win_input */
+static void editbuf_display () {
+	wclear(win_input);
+	if (terminal.flags & TERM_FLAG_ECHO) {
+		mvwaddnstr(win_input, 0, 0, editbuf.buf, editbuf.size);
+	} else {
+		wmove(win_input, 0, 0);
+		size_t i;
+		for (i = 0; i != editbuf.size; ++i)
+			waddch(win_input, '*');
+	}
+	wmove(win_input, 0, editbuf.pos);
 }
 
 /* paint banner */
@@ -193,41 +317,55 @@ static void do_send (const char* bytes, size_t len) {
 
 /* process user input */
 static void on_key (int key) {
-	size_t len = strlen(user_line);
+	/* special keys */
+	if (key >= KEY_MIN && key <= KEY_MAX) {
+		/* send */
+		if (key == KEY_ENTER) {
+			/* send line to server */
+			protocol.on_line(editbuf.buf, editbuf.size);
+			/* reset input */
+			editbuf_set("");
+		}
 
-	/* send */
-	if (key == '\n' || key == '\r' || key == KEY_ENTER) {
-		/* send line to server */
-		protocol.on_line(user_line, len);
-		/* reset input */
-		user_line[0] = 0;
-	}
+		/* backspace/delete */
+		else if (key == KEY_BACKSPACE) {
+			editbuf_bs();
+		}
+		else if (key == KEY_DC) {
+			editbuf_del();
+		}
 
-	/* backspace; remove last character */
-	else if (key == KEY_BACKSPACE) {
-		if (len > 0)
-			user_line[len-1] = 0;
-	}
-	
-	/* attempt to add */
-	else if (key < KEY_MIN && isprint(key)) {
-		/* only if we're not full */
-		if (len <= sizeof(user_line) - 1) {
-			user_line[len] = key;
-			user_line[len+1] = 0;
+		/* move cursor left/right */
+		else if (key == KEY_LEFT) {
+			editbuf_curleft();
+		}
+		else if (key == KEY_RIGHT) {
+			editbuf_curright();
+		}
+		else if (key == KEY_HOME) {
+			editbuf_home();
+		}
+		else if (key == KEY_END) {
+			editbuf_end();
+		}
+
+	/* regular text */
+	} else {
+		/* send */
+		if (key == '\n' || key == '\r') {
+			/* send line to server */
+			protocol.on_line(editbuf.buf, editbuf.size);
+			/* reset input */
+			editbuf_set("");
+
+		/* add key to edit buffer */
+		} else {
+			editbuf_insert(key);
 		}
 	}
 
 	/* draw input */
-	wclear(win_input);
-	if (terminal.flags & TERM_FLAG_ECHO) {
-		mvwaddstr(win_input, 0, 0, user_line);
-	} else {
-		wmove(win_input, 0, 0);
-		int i;
-		for (i = strlen(user_line); i > 0; --i)
-			waddch(win_input, '*');
-	}
+	editbuf_display();
 }
 
 /* perform a terminal escape */
@@ -505,8 +643,8 @@ int main (int argc, char** argv) {
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGWINCH, &sa, NULL);
 
-	/* initialize user line buffer */
-	user_line[0] = 0;
+	/* initial edit buffer */
+	memset(&editbuf, 0, sizeof(struct EDITBUF));
 
 	/* setup poll info */
 	struct pollfd fds[2];
@@ -568,10 +706,13 @@ int main (int argc, char** argv) {
 		doupdate();
 	}
 
-	/* final display */
+	/* final display, pause */
 	snprintf(banner, sizeof(banner), "CLC - %s:%s (disconnected)", host, port);
-	redraw_display();
+	wnoutrefresh(win_banner);
+	doupdate();
 	wgetch(win_input);
+
+	/* clean up */
 	endwin();
 	printf("Disconnected.\n");
 
@@ -652,7 +793,7 @@ static void telnet_on_line (const char* line, size_t len) {
 	/* echo output */
 	if (terminal.flags & TERM_FLAG_ECHO) {
 		wattron(win_main, COLOR_PAIR(COLOR_YELLOW));
-		waddnstr(win_main, user_line, len+1);
+		waddnstr(win_main, line, len);
 		waddch(win_main, '\n');
 		wattron(win_main, COLOR_PAIR(terminal.color));
 	}
