@@ -1,3 +1,10 @@
+/**
+ * Command-Line Client
+ * Sean Middleditch, AwesomePlay Productions Inc.
+ * elanthis@awemud.net
+ * PUBLIC DOMAIN
+ */
+
 #include <termio.h>
 #include <signal.h>
 #include <ncurses.h>
@@ -11,45 +18,60 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <arpa/telnet.h>
+#include <netdb.h>
 
-/* telnet info */
+/* telnet protocol */
 typedef enum { TELNET_TEXT, TELNET_IAC, TELNET_DO, TELNET_DONT, TELNET_WILL, TELNET_WONT, TELNET_SUB, TELNET_SUBIAC } telnet_state_t;
 
 #define TELNET_MAX_SUB (1024*8)
 #define TELNET_MAX_ZMP_ARGS 32
 
 #define TELNET_FLAG_ZMP (1<<0)
+#define TELNET_FLAG_NAWS (1<<1)
 #define TELNET_FLAGS_DEFAULT 0
 
 struct TELNET {
 	telnet_state_t state;
-	int sock;
 	char sub_buf[TELNET_MAX_SUB];
 	size_t sub_size;
 	char flags;
 } telnet;
 
-/* functions */
+static void telnet_on_line(const char* line, size_t len);
+static void telnet_on_recv(const char* bytes, size_t len);
+static void telnet_on_resize(int w, int h);
+
 static void telnet_send_cmd(int cmd);
 static void telnet_send_opt(int type, int opt);
-static void do_send_esc (const char* bytes, size_t len);
+static void telnet_send_esc(const char* bytes, size_t len);
+static void telnet_do_subreq (void);
 
-/* ZMP setup */
+/* websock protocol */
+#define WEBSOCK_MAX_MSG 2048
 
-typedef void (*zmp_cb_t)(int argc, char** argv);
+struct WEBSOCK {
+	char msg[WEBSOCK_MAX_MSG];
+	size_t msg_size;
+} websock;
 
-struct ZMP {
-	const char* name;
-	zmp_cb_t cb;
-	struct ZMP* next;
-};
-struct ZMP* zmp_list;
+static void websock_on_line(const char* line, size_t len);
+static void websock_on_recv(const char* bytes, size_t len);
+static void websock_on_resize(int w, int h);
 
-/* ZMP handlers */
+/* protocol handler */
+typedef enum { PROTOCOL_TELNET, PROTOCOL_WEBSOCK } protocol_type_t;
 
-static void zmp_check (int argc, char** argv);
+struct PROTOCOL {
+	protocol_type_t type;
 
-/* terminal output parser */
+	void (*on_line)(const char* line, size_t len);
+	void (*on_recv)(const char* bytes, size_t len);
+	void (*on_resize)(int w, int h);
+} protocol;
+
+static void protocol_init(protocol_type_t type);
+
+/* terminal processing */
 typedef enum { TERM_ASCII, TERM_ESC, TERM_ESCRUN } term_state_t;
 
 #define TERM_MAX_ESC 16
@@ -66,6 +88,9 @@ struct TERMINAL {
 	int color;
 } terminal;
 
+/* running flag; when 0, exit main loop */
+static int running = 1;
+
 /* line buffer */
 static char user_line[1024];
 
@@ -73,13 +98,18 @@ static char user_line[1024];
 static char banner[1024];
 
 /* windows */
-static WINDOW* win_main;
-static WINDOW* win_input;
-static WINDOW* win_banner;
+static WINDOW* win_main = 0;
+static WINDOW* win_input = 0;
+static WINDOW* win_banner = 0;
 
 /* last interrupt */
-volatile int have_sigwinch;
-volatile int have_sigint;
+volatile int have_sigwinch = 0;
+volatile int have_sigint = 0;
+
+/* server socket */
+static int sock;
+
+/* ======= CORE ======= */
 
 /* cleanup function */
 static void cleanup (void) {
@@ -123,12 +153,11 @@ static void redraw_display (void) {
 	/* update */
 	paint_banner();
 
-	/* send telnet size update */
-	telnet_send_opt(SB, TELOPT_NAWS);
-	unsigned short w = htons(COLS), h = htons(LINES);
-	do_send_esc((char*)&w, 2);
-	do_send_esc((char*)&h, 2);
-	telnet_send_cmd(SE);
+	/* update size on protocol */
+	if (running) {
+		unsigned short w = htons(COLS), h = htons(LINES);
+		protocol.on_resize(w, h);
+	}
 
 	/* refresh */
 	wnoutrefresh(win_main);
@@ -137,11 +166,13 @@ static void redraw_display (void) {
 	doupdate();
 }
 
-/* force-send bytes to telnet server */
+/* force-send bytes to websock server */
 static void do_send (const char* bytes, size_t len) {
 	int ret;
+
+	/* keep sending bytes until they're all sent */
 	while (len > 0) {
-		ret = send(telnet.sock, bytes, len, 0);
+		ret = send(sock, bytes, len, 0);
 		if (ret == -1) {
 			if (ret != EAGAIN && ret != EINTR) {
 				endwin();
@@ -151,7 +182,7 @@ static void do_send (const char* bytes, size_t len) {
 			continue;
 		} else if (ret == 0) {
 			endwin();
-			printf("Disconnected.\n");
+			printf("Disconnected from server\n");
 			exit(0);
 		} else {
 			bytes += ret;
@@ -160,52 +191,14 @@ static void do_send (const char* bytes, size_t len) {
 	}
 }
 
-/* force-send bytes to telnet server, escaping IAC */
-static void do_send_esc (const char* bytes, size_t len) {
-	size_t last = 0;
-	size_t i;
-	char esc[2] = { IAC, IAC };
-	for (i = 0; i < len; ++i) {
-		/* found an IAC?  dump text so far, send esc */
-		if ((unsigned char)bytes[i] == IAC) {
-			if (i > last)
-				do_send(bytes + last, i - last);
-			do_send(esc, 2);
-			last = i + 1;
-		}
-	}
-	/* send remainder */
-	if (i > last)
-		do_send(bytes + last, i - last);
-}
-
-/* send a telnet cmd */
-static void telnet_send_cmd(int cmd) {
-	char bytes[2] = { IAC, cmd };
-	do_send(bytes, 2);
-}
-
-/* send a telnet option */
-static void telnet_send_opt(int type, int opt) {
-	char bytes[3] = { IAC, type, opt };
-	do_send(bytes, 3);
-}
-
 /* process user input */
 static void on_key (int key) {
 	size_t len = strlen(user_line);
 
 	/* send */
 	if (key == '\n' || key == '\r' || key == KEY_ENTER) {
-		user_line[len] = '\n';
 		/* send line to server */
-		do_send_esc(user_line, len+1);
-		/* echo output */
-		if (terminal.flags & TERM_FLAG_ECHO) {
-			wattron(win_main, COLOR_PAIR(COLOR_YELLOW));
-			waddnstr(win_main, user_line, len+1);
-			wattron(win_main, COLOR_PAIR(terminal.color));
-		}
+		protocol.on_line(user_line, len);
 		/* reset input */
 		user_line[0] = 0;
 	}
@@ -227,8 +220,14 @@ static void on_key (int key) {
 
 	/* draw input */
 	wclear(win_input);
-	if (terminal.flags & TERM_FLAG_ECHO)
+	if (terminal.flags & TERM_FLAG_ECHO) {
 		mvwaddstr(win_input, 0, 0, user_line);
+	} else {
+		wmove(win_input, 0, 0);
+		int i;
+		for (i = strlen(user_line); i > 0; --i)
+			waddch(win_input, '*');
+	}
 }
 
 /* perform a terminal escape */
@@ -260,8 +259,18 @@ static void on_term_esc(char cmd) {
 	}
 }
 
+/* process text into virtual terminal, no ANSI */
+static void on_text_plain (const char* text, size_t len) {
+	size_t i;
+	for (i = 0; i < len; ++i) {
+		/* don't send ESC codes, for safety */
+		if (text[i] != 27)
+			waddch(win_main, text[i]);
+	}
+}
+
 /* process text into virtual terminal */
-static void on_text (const char* text, size_t len) {
+static void on_text_ansi (const char* text, size_t len) {
 	size_t i;
 	for (i = 0; i < len; ++i) {
 		switch (terminal.state) {
@@ -309,66 +318,336 @@ static void on_text (const char* text, size_t len) {
 	}
 }
 
-/* process ZMP chunk in subrequest */
-static void on_zmp (const char* data, size_t len) {
-	const char* argv[TELNET_MAX_ZMP_ARGS];
-	size_t argc;
+/* initialize the protocol */
+static void protocol_init (protocol_type_t type) {
+	protocol.type = type;
 
-	/* initial arg */
-	argc = 1;
-	argv[0] = data;
-
-	/* find additional args */
-	const char* next = argv[0] + strlen(argv[0]);
-	endwin();
-	while (next - data != len) {
-		/* fail on overflow */
-		if (argc == TELNET_MAX_ZMP_ARGS)
-			return;
-
-		/* store it */
-		argv[argc] = next + 1;
-		next = argv[argc] + strlen(argv[argc]);
-		++argc;
-	}
-
-	/* find the command */
-	struct ZMP* zmp = zmp_list;
-	while (zmp != NULL) {
-		/* if match, execute and end */
-		if (strcmp(zmp->name, argv[0]) == 0) {
-			zmp->cb(argc, (char**)argv);
-			break;
-		}
-		zmp = zmp->next;
+	if (type == PROTOCOL_TELNET) {
+		protocol.on_line = telnet_on_line;
+		protocol.on_recv = telnet_on_recv;
+		protocol.on_resize = telnet_on_resize;
+	} else if (type == PROTOCOL_WEBSOCK) {
+		protocol.on_line = websock_on_line;
+		protocol.on_recv = websock_on_recv;
+		protocol.on_resize = websock_on_resize;
 	}
 }
 
-/* process telnet subrequest */
-static void on_subreq (void) {
-	/* must have at least one byte */
-	if (telnet.sub_size == 0)
-		return;
+/* attempt to connect to the requested hostname on the request port */
+static int do_connect (const char* host, const char* port) {
+	struct addrinfo hints;
+	struct addrinfo *results;
+	struct addrinfo *ai;
+	int ret;
+	int sock;
 
-	switch (telnet.sub_buf[0]) {
-		/* ZMP command */
-		case 93:
-			/* ZMP not turned on?  ignore */
-			if ((telnet.flags & TELNET_FLAG_ZMP) == 0)
-				return;
+	/* lookup host */
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
 
-			/* sanity check */
-			if (telnet.sub_size < 3 || !isalpha(telnet.sub_buf[1]) || telnet.sub_buf[telnet.sub_size-1] != 0)
-				return;
+	if ((ret = getaddrinfo(host, port, &hints, &results)) != 0) {
+		fprintf(stderr, "Host lookup failed: %s\n", gai_strerror(ret));
+		return -1;
+	}
 
-			/* invoke ZMP */
-			on_zmp(&telnet.sub_buf[1], telnet.sub_size - 1);
-			break;
+	/* loop through hosts, trying to connect */
+	for (ai = results; ai != NULL; ai = ai->ai_next) {
+		/* create socket */
+		sock = socket(AF_INET, SOCK_STREAM, 0);
+		if (sock == -1) {
+			fprintf(stderr, "socket() failed: %s\n", strerror(errno));
+			exit(1);
+		}
+
+		/* connect */
+		if (connect(sock, ai->ai_addr, ai->ai_addrlen) != -1) {
+			freeaddrinfo(results);
+			return sock;
+		}
+
+		/* release socket */
+		shutdown(sock, SHUT_RDWR);
+	}
+
+	/* could not connect */
+	freeaddrinfo(results);
+	return -1;
+}
+
+int main (int argc, char** argv) {
+	/* configuration */
+	protocol_type_t type = PROTOCOL_TELNET;
+	const char* host = NULL;
+	const char* port = NULL;
+	const char* default_port = "23";
+
+	/* process command line args
+	 *
+	 * usage:
+	 *  client [options] <host> [<port>]
+	 * 
+	 * options:
+	 *  -t  use telnet (port 23)
+	 *  -w  use websock (port 4747)
+	 */
+	int i;
+	for (i = 1; i < argc; ++i) {
+		/* set protocol to telnet */
+		if (strcmp(argv[i], "-t") == 0) {
+			type = PROTOCOL_TELNET;
+			default_port = "23";
+			continue;
+		}
+
+		/* set protocol to websock */
+		if (strcmp(argv[i], "-w") == 0) {
+			type = PROTOCOL_WEBSOCK;
+			default_port = "4747";
+			continue;
+		}
+
+		/* other unknown option */
+		if (argv[i][0] == '-') {
+			fprintf(stderr, "Unknown option %s\n", argv[i]);
+			exit(1);
+		}
+
+		/* if host is unset, this is the host */
+		if (host == NULL) {
+			host = argv[i];
+		/* otherwise, it's a port */
+		} else {
+			port = argv[i];
+		}
+	}
+
+	/* ensure we have a host */
+	if (host == NULL) {
+		fprintf(stderr, "No host was given\n");
+		exit(1);
+	}
+
+	/* set default port if none was given */
+	if (port == NULL)
+		port = default_port;
+
+	/* cleanup on any failure */
+	atexit(cleanup);
+
+	/* set terminal defaults */
+	memset(&terminal, 0, sizeof(struct TERMINAL));
+	terminal.state = TERM_ASCII;
+	terminal.flags = TERM_FLAGS_DEFAULT;
+	terminal.color = TERM_COLOR_DEFAULT;
+
+	/* initial websock and telnet handlers */
+	memset(&telnet, 0, sizeof(struct TELNET));
+	memset(&websock, 0, sizeof(struct WEBSOCK));
+
+	/* configure protocol */
+	protocol_init(type);
+
+	/* connect to server */
+	sock = do_connect(host, port);
+	if (sock == -1) {
+		fprintf(stderr, "Failed to connect to %s:%s\n", host, port);
+		exit(1);
+	}
+	printf("Connected to %s:%s\n", host, port);
+
+	/* set initial banner */
+	snprintf(banner, sizeof(banner), "CLC - %s:%s (connected)", host, port);
+
+	/* configure curses */
+	initscr();
+	start_color();
+	nonl();
+	cbreak();
+	noecho();
+
+	win_main = newwin(LINES-2, COLS, 0, 0);
+	win_banner = newwin(1, COLS, LINES-2, 0);
+	win_input = newwin(1, COLS, LINES-1, 0);
+
+	idlok(win_main, TRUE);
+	scrollok(win_main, TRUE);
+
+	nodelay(win_input, FALSE);
+	keypad(win_input, TRUE);
+
+	use_default_colors();
+
+	init_pair(COLOR_RED, COLOR_RED, -1);
+	init_pair(COLOR_BLUE, COLOR_BLUE, -1);
+	init_pair(COLOR_GREEN, COLOR_GREEN, -1);
+	init_pair(COLOR_CYAN, COLOR_CYAN, -1);
+	init_pair(COLOR_MAGENTA, COLOR_MAGENTA, -1);
+	init_pair(COLOR_YELLOW, COLOR_YELLOW, -1);
+	init_pair(COLOR_WHITE, COLOR_WHITE, -1);
+
+	init_pair(TERM_COLOR_DEFAULT, -1, -1);
+	wbkgd(win_main, COLOR_PAIR(TERM_COLOR_DEFAULT));
+	wclear(win_main);
+	init_pair(10, COLOR_WHITE, COLOR_BLUE);
+	wbkgd(win_banner, COLOR_PAIR(10));
+	wclear(win_banner);
+	init_pair(11, -1, -1);
+	wbkgd(win_input, COLOR_PAIR(11));
+	wclear(win_input);
+
+	redraw_display();
+
+	/* set signal handlers */
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = handle_signal;
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGWINCH, &sa, NULL);
+
+	/* initialize user line buffer */
+	user_line[0] = 0;
+
+	/* setup poll info */
+	struct pollfd fds[2];
+	fds[0].fd = 1;
+	fds[0].events = POLLIN;
+	fds[1].fd = sock;
+	fds[1].events = POLLIN;
+
+	/* main loop */
+	while (running) {
+		/* poll sockets */
+		if (poll(fds, 2, -1) == -1) {
+			if (errno != EAGAIN && errno != EINTR) {
+				endwin();
+				fprintf(stderr, "poll() failed: %s\n", strerror(errno));
+				return 1;
+			}
+		}
+
+		/* resize event? */
+		if (have_sigwinch) {
+			have_sigwinch = 0;
+			redraw_display();
+		}
+
+		/* escape? */
+		if (have_sigint) {
+			exit(0);
+		}
+
+		/* input? */
+		if (fds[0].revents & POLLIN) {
+			int key = wgetch(win_input);
+			if (key != ERR)
+				on_key(key);
+		}
+
+		/* websock data */
+		if (fds[1].revents & POLLIN) {
+			char buffer[2048];
+			int ret = recv(sock, buffer, sizeof(buffer), 0);
+			if (ret == -1) {
+				if (errno != EAGAIN && errno != EINTR) {
+					endwin();
+					fprintf(stderr, "recv() failed: %s\n", strerror(errno));
+					return 1;
+				}
+			} else if (ret == 0) {
+				running = 0;
+			} else {
+				protocol.on_recv(buffer, ret);
+			}
+		}
+
+		/* flush output */
+		wnoutrefresh(win_main);
+		wnoutrefresh(win_banner);
+		wnoutrefresh(win_input);
+		doupdate();
+	}
+
+	/* final display */
+	snprintf(banner, sizeof(banner), "CLC - %s:%s (disconnected)", host, port);
+	redraw_display();
+	wgetch(win_input);
+	endwin();
+	printf("Disconnected.\n");
+
+	return 0;
+}
+
+/* ======= WEBSOCK ======= */
+
+/* send a command line to the server */
+static void websock_on_line (const char* line, size_t len) {
+	char cmd = '=';
+	char nul = 0;
+
+	/* send =(line)NUL */
+	do_send(&cmd, 1);
+	do_send(line, len);
+	do_send(&nul, 1);
+}
+
+/* process input from websock */
+static void websock_on_recv(const char* data, size_t len) {
+	size_t i;
+	for (i = 0; i < len; ++i) {
+		if (data[i] != 0) {
+			/* don't allow overflow */
+			if (websock.msg_size == WEBSOCK_MAX_MSG) {
+				/* ignore FIXME */
+			} else {
+				websock.msg[websock.msg_size++] = data[i];
+			}
+		} else {
+			/* process the message */
+			switch (websock.msg[0]) {
+				/* text */
+				case '"':
+					on_text_plain(&websock.msg[1], websock.msg_size - 1);
+					break;
+				/* prompt */
+				case '>':
+					snprintf(banner, sizeof(banner), "%.*s", (int)websock.msg_size - 1, &websock.msg[1]);
+					paint_banner();
+					break;
+			}
+
+			/* reset buffer */
+			websock.msg[0] = 0;
+			websock.msg_size = 0;
+		}
+	}
+}
+
+/* websock has no sizing commands; ignore */
+static void websock_on_resize (int w, int h) {
+	/* do nothing */
+}
+
+/* ======= TELNET ======= */
+
+/* send a line to the server */
+static void telnet_on_line (const char* line, size_t len) {
+	/* send with proper newline */
+	char nl[] = { '\n', '\r' };
+	telnet_send_esc(line, len);
+	telnet_send_esc(nl, sizeof(nl));
+
+	/* echo output */
+	if (terminal.flags & TERM_FLAG_ECHO) {
+		wattron(win_main, COLOR_PAIR(COLOR_YELLOW));
+		waddnstr(win_main, user_line, len+1);
+		waddch(win_main, '\n');
+		wattron(win_main, COLOR_PAIR(terminal.color));
 	}
 }
 
 /* process input from telnet */
-static void on_input (const char* data, size_t len) {
+static void telnet_on_recv (const char* data, size_t len) {
 	size_t i;
 	for (i = 0; i < len; ++i) {
 		switch (telnet.state) {
@@ -378,12 +657,12 @@ static void on_input (const char* data, size_t len) {
 					telnet.state = TELNET_IAC;
 				/* text */
 				else
-					on_text(&data[i], 1);
+					on_text_ansi(&data[i], 1);
 				break;
 			case TELNET_IAC:
 				/* IAC IAC escape */
 				if ((unsigned char)data[i] == IAC)
-					on_text(&data[i], 1);
+					on_text_ansi(&data[i], 1);
 				/* DO/DONT/WILL/WONT */
 				else if ((unsigned char)data[i] == DO)
 					telnet.state = TELNET_DO;
@@ -408,9 +687,15 @@ static void on_input (const char* data, size_t len) {
 				break;
 			case TELNET_DO:
 				switch (data[i]) {
+					/* enable NAWS support */
 					case TELOPT_NAWS:
+					{
+						telnet.flags |= TELNET_FLAG_NAWS;
 						telnet_send_opt(WILL, TELOPT_NAWS);
+						unsigned short w = htons(COLS), h = htons(LINES);
+						protocol.on_resize(w, h);
 						break;
+					}
 				}
 				telnet.state = TELNET_TEXT;
 				break;
@@ -460,7 +745,7 @@ static void on_input (const char* data, size_t len) {
 				/* end, process */
 				else if ((unsigned char)data[i] == SE) {
 					telnet.state = TELNET_TEXT;
-					on_subreq();
+					telnet_do_subreq();
 				}
 				/* something else; error */
 				else
@@ -470,245 +755,67 @@ static void on_input (const char* data, size_t len) {
 	}
 }
 
-/* register a ZMP handler */
-static void zmp_register (const char* name, zmp_cb_t cb) {
-	struct ZMP* zmp;
-
-	zmp = (struct ZMP*)malloc(sizeof(struct ZMP));
-	if (zmp == NULL) {
-		endwin();
-		fprintf(stderr, "malloc() failed: %s\n", strerror(errno));
-		exit(1);
+/* send NAWS update */
+static void telnet_on_resize (int w, int h) {
+	/* send NAWS if enabled */
+	if (telnet.flags & TELNET_FLAG_NAWS) {
+		telnet_send_opt(SB, TELOPT_NAWS);
+		telnet_send_esc((char*)&w, 2);
+		telnet_send_esc((char*)&h, 2);
+		telnet_send_cmd(SE);
 	}
-	zmp->next = zmp_list;
-	zmp->name = name;
-	zmp->cb = cb;
-	zmp_list = zmp;
 }
 
-/* check if a given command/package is supported */
-static int zmp_do_check (const char* name) {
-	size_t len = strlen(name);
-
-	/* empty name?  no, not supported... */
-	if (len == 0)
-		return 0;
-
-	/* package check */
-	if (name[len-1] == '.') {
-		struct ZMP* zmp = zmp_list;
-		while (zmp != NULL) {
-			if (strncmp(zmp->name, name, len) == 0)
-				return 1;
-			zmp = zmp->next;
+/* force-send bytes to telnet server, escaping IAC */
+static void telnet_send_esc (const char* bytes, size_t len) {
+	size_t last = 0;
+	size_t i;
+	char esc[2] = { IAC, IAC };
+	for (i = 0; i < len; ++i) {
+		/* found an IAC?  dump text so far, send esc */
+		if ((unsigned char)bytes[i] == IAC) {
+			if (i > last)
+				do_send(bytes + last, i - last);
+			do_send(esc, 2);
+			last = i + 1;
 		}
 	}
-	/* command check */
-	else {
-		struct ZMP* zmp = zmp_list;
-		while (zmp != NULL) {
-			if (strcmp(zmp->name, name) == 0)
-				return 1;
-			zmp = zmp->next;
-		}
-	}
-
-	/* no match found */
-	return 0;
+	/* send remainder */
+	if (i > last)
+		do_send(bytes + last, i - last);
 }
 
-/* send a ZMP command */
-static void zmp_send (int argc, char** argv) {
-	/* no args... ignore */
-	if (argc < 1)
+/* send a telnet cmd */
+static void telnet_send_cmd(int cmd) {
+	char bytes[2] = { IAC, cmd };
+	do_send(bytes, 2);
+}
+
+/* send a telnet option */
+static void telnet_send_opt(int type, int opt) {
+	char bytes[3] = { IAC, type, opt };
+	do_send(bytes, 3);
+}
+
+/* process telnet subrequest */
+static void telnet_do_subreq (void) {
+	/* must have at least one byte */
+	if (telnet.sub_size == 0)
 		return;
 
-	/* send header */
-	char hdr[3] = { IAC, SB, 93 };
-	do_send(hdr, 3);
+	switch (telnet.sub_buf[0]) {
+		/* ZMP command */
+		case 93:
+			/* ZMP not turned on?  ignore */
+			if ((telnet.flags & TELNET_FLAG_ZMP) == 0)
+				return;
 
-	/* send args */
-	size_t i;
-	for (i = 0; i < argc; ++i) {
-		/* remember to include NUL byte */
-		do_send_esc(argv[i], strlen(argv[i]) + 1);
-	}
+			/* sanity check */
+			if (telnet.sub_size < 3 || !isalpha(telnet.sub_buf[1]) || telnet.sub_buf[telnet.sub_size-1] != 0)
+				return;
 
-	/* send footer */
-	char ftr[2] = { IAC, SE };
-	do_send(ftr, 2);
-}
-
-int main (int argc, char** argv) {
-	/* cleanup on any failure */
-	atexit(cleanup);
-
-	/* set terminal defaults */
-	terminal.state = TERM_ASCII;
-	terminal.flags = TERM_FLAGS_DEFAULT;
-	terminal.color = TERM_COLOR_DEFAULT;
-
-	/* set telnet defaults */
-	telnet.state = TELNET_TEXT;
-	telnet.flags = TELNET_FLAGS_DEFAULT;
-
-	/* register ZMP handlers */
-	zmp_list = NULL;
-	zmp_register("zmp.check", zmp_check);
-
-	/* connect to server */
-	struct sockaddr_in sockaddr;
-	socklen_t socklen;
-
-	telnet.sock = socket(AF_INET, SOCK_STREAM, 0);
-	if (telnet.sock == -1) {
-		fprintf(stderr, "socket() failed: %s\n", strerror(errno));
-		return 1;
-	}
-
-	memset(&sockaddr, 0, sizeof(sockaddr));
-	socklen = sizeof(sockaddr);
-
-	if (bind(telnet.sock, (struct sockaddr*)&sockaddr, socklen) == -1) {
-		fprintf(stderr, "bind() failed: %s\n", strerror(errno));
-		return 1;
-	}
-
-	memset(&sockaddr, 0, sizeof(sockaddr));
-	socklen = sizeof(sockaddr);
-	sockaddr.sin_family = AF_INET;
-	sockaddr.sin_port = htons(4545);
-	inet_pton(AF_INET, "127.0.0.1", &sockaddr.sin_addr);
-
-	if (connect(telnet.sock, (struct sockaddr*)&sockaddr, socklen) == -1) {
-		fprintf(stderr, "connect() failed: %s\n", strerror(errno));
-		return 1;
-	}
-
-	/* set initial banner */
-	snprintf(banner, sizeof(banner), "localhost:4545 - CLC");
-
-	/* configure curses */
-	initscr();
-	start_color();
-	nonl();
-	cbreak();
-	noecho();
-
-	win_main = newwin(LINES-2, COLS, 0, 0);
-	win_banner = newwin(1, COLS, LINES-2, 0);
-	win_input = newwin(1, COLS, LINES-1, 0);
-
-	idlok(win_main, TRUE);
-	scrollok(win_main, TRUE);
-
-	nodelay(win_input, TRUE);
-	keypad(win_input, TRUE);
-
-	init_pair(COLOR_RED, COLOR_RED, COLOR_BLACK);
-	init_pair(COLOR_BLUE, COLOR_BLUE, COLOR_BLACK);
-	init_pair(COLOR_GREEN, COLOR_GREEN, COLOR_BLACK);
-	init_pair(COLOR_CYAN, COLOR_CYAN, COLOR_BLACK);
-	init_pair(COLOR_MAGENTA, COLOR_MAGENTA, COLOR_BLACK);
-	init_pair(COLOR_YELLOW, COLOR_YELLOW, COLOR_BLACK);
-	init_pair(COLOR_WHITE, COLOR_WHITE, COLOR_BLACK);
-
-	init_pair(TERM_COLOR_DEFAULT, COLOR_WHITE, COLOR_BLACK);
-	wbkgd(win_main, COLOR_PAIR(TERM_COLOR_DEFAULT));
-	wclear(win_main);
-	init_pair(10, COLOR_WHITE, COLOR_BLUE);
-	wbkgd(win_banner, COLOR_PAIR(10));
-	wclear(win_banner);
-	init_pair(11, COLOR_YELLOW, COLOR_BLACK);
-	wbkgd(win_input, COLOR_PAIR(11));
-	wclear(win_input);
-
-	redraw_display();
-
-	/* set signal handlers */
-	struct sigaction sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = handle_signal;
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGWINCH, &sa, NULL);
-
-	/* initialize user line buffer */
-	user_line[0] = 0;
-
-	/* setup poll info */
-	struct pollfd fds[2];
-	fds[0].fd = 1;
-	fds[0].events = POLLIN;
-	fds[1].fd = telnet.sock;
-	fds[1].events = POLLIN;
-
-	/* main loop */
-	while (true) {
-		/* poll sockets */
-		if (poll(fds, 2, -1) == -1) {
-			if (errno != EAGAIN && errno != EINTR) {
-				endwin();
-				fprintf(stderr, "poll() failed: %s\n", strerror(errno));
-				return 1;
-			}
-		}
-
-		/* resize event? */
-		if (have_sigwinch) {
-			have_sigwinch = 0;
-			redraw_display();
-		}
-
-		/* escape? */
-		if (have_sigint) {
-			exit(0);
-		}
-
-		/* input? */
-		if (fds[0].revents & POLLIN) {
-			int key;
-			while ((key = wgetch(win_input)) != ERR)
-				on_key(key);
-		}
-
-		/* telnet data */
-		if (fds[1].revents & POLLIN) {
-			char buffer[2048];
-			int ret = recv(telnet.sock, buffer, sizeof(buffer), 0);
-			if (ret == -1) {
-				if (errno != EAGAIN && errno != EINTR) {
-					endwin();
-					fprintf(stderr, "recv() failed: %s\n", strerror(errno));
-					return 1;
-				}
-			} else if (ret == 0) {
-				endwin();
-				printf("Disconnected.\n");
-				return 0;
-			} else {
-				on_input(buffer, ret);
-			}
-		}
-
-		/* flush output */
-		wnoutrefresh(win_main);
-		wnoutrefresh(win_banner);
-		wnoutrefresh(win_input);
-		doupdate();
-	}
-
-	return 0;
-}
-
-/*** ZMP handlers ***/
-
-static void zmp_check (int argc, char** argv) {
-	if (argc != 2) return;
-	if (zmp_do_check(argv[1])) {
-		char* sargv[2] = { "zmp.support", argv[1] };
-		zmp_send(2, sargv);
-	} else {
-		char* sargv[2] = { "zmp.no-support", argv[1] };
-		zmp_send(2, sargv);
+			/* invoke ZMP */
+			/* on_zmp(&telnet.sub_buf[1], telnet.sub_size - 1); */
+			break;
 	}
 }
