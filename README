@@ -1,0 +1,9 @@
+Command-Line Client
+Sean Middleditch <elanthis@sourcemud.org>
+THIS CODE IS PUBLIC DOMAIN
+=========================================
+
+CLC is a simplistic MUD client written in C for the author's utilitarian needs.
+
+CLC supports a basic telnet protocol handler with ZMP support as well as support
+for the WebSock protocol.

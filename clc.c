@@ -1,24 +1,23 @@
 /**
  * Command-Line Client
- * Sean Middleditch, AwesomePlay Productions Inc.
- * elanthis@awemud.net
- * PUBLIC DOMAIN
+ * Sean Middleditch <elanthis@sourcemud.org>
+ * THIS CODE IS PUBLIC DOMAIN
  */
 
-#include <termio.h>
-#include <signal.h>
-#include <ncurses.h>
-#include <stdlib.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/poll.h>
+#include <arpa/inet.h>
+#include <arpa/telnet.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <signal.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <string.h>
-#include <arpa/inet.h>
 #include <ctype.h>
-#include <arpa/telnet.h>
-#include <netdb.h>
+#include <termio.h>
+#include <ncurses.h>
 
 /* telnet protocol */
 typedef enum { TELNET_TEXT, TELNET_IAC, TELNET_DO, TELNET_DONT, TELNET_WILL, TELNET_WONT, TELNET_SUB, TELNET_SUBIAC } telnet_state_t;
@@ -102,7 +101,6 @@ static void editbuf_set(const char*);
 static void editbuf_insert(int);
 static void editbuf_bs();
 static void editbuf_del();
-static void editbuf_eraseword();
 static void editbuf_curleft();
 static void editbuf_curright();
 static void editbuf_display();
@@ -114,6 +112,7 @@ static int running = 1;
 
 /* banner buffer */
 static char banner[1024];
+static int autobanner = 1;
 
 /* windows */
 static WINDOW* win_main = 0;
@@ -125,7 +124,11 @@ volatile int have_sigwinch = 0;
 volatile int have_sigint = 0;
 
 /* server socket */
+const char* host = NULL;
+const char* port = NULL;
 static int sock;
+static size_t sent_bytes = 0;
+static size_t recv_bytes = 0;
 
 /* core functions */
 static void on_text_plain (const char* text, size_t len);
@@ -213,10 +216,6 @@ static void editbuf_del () {
 	--editbuf.size;
 }
 
-/* delete prior word */
-static void editbuf_eraseword () {
-}
-
 /* move to home position */
 static void editbuf_home () {
 	editbuf.pos = 0;
@@ -255,6 +254,12 @@ static void editbuf_display () {
 
 /* paint banner */
 static void paint_banner (void) {
+	/* if autobanner is on, build our banner buffer */
+	if (autobanner) {
+		snprintf(banner, sizeof(banner), "%s:%s - (%s)", host, port, sock == -1 ? "disconnected" : "connected");
+	}
+
+	/* paint */
 	wclear(win_banner);
 	mvwaddstr(win_banner, 0, 0, banner);
 }
@@ -283,6 +288,9 @@ static void redraw_display (void) {
 		protocol.on_resize(w, h);
 	}
 
+	/* input display */
+	editbuf_display();
+
 	/* refresh */
 	wnoutrefresh(win_main);
 	wnoutrefresh(win_banner);
@@ -309,6 +317,7 @@ static void do_send (const char* bytes, size_t len) {
 			printf("Disconnected from server\n");
 			exit(0);
 		} else {
+			sent_bytes += ret;
 			bytes += ret;
 			len -= ret;
 		}
@@ -514,11 +523,10 @@ static int do_connect (const char* host, const char* port) {
 }
 
 int main (int argc, char** argv) {
-	/* configuration */
 	protocol_type_t type = PROTOCOL_TELNET;
-	const char* host = NULL;
-	const char* port = NULL;
 	const char* default_port = "23";
+	struct sigaction sa;
+	int i;
 
 	/* process command line args
 	 *
@@ -529,7 +537,6 @@ int main (int argc, char** argv) {
 	 *  -t  use telnet (port 23)
 	 *  -w  use websock (port 4747)
 	 */
-	int i;
 	for (i = 1; i < argc; ++i) {
 		/* set protocol to telnet */
 		if (strcmp(argv[i], "-t") == 0) {
@@ -545,9 +552,30 @@ int main (int argc, char** argv) {
 			continue;
 		}
 
+		/* help */
+		if (strcmp(argv[i], "-h") == 0) {
+			printf(
+				"CLC by Sean Middleditch <elanthis@sourcemud.org>\n"
+				"This program has been released into the PUBLIC DOMAIN.\n\n"
+				"Usage:\n"
+				"  clc [-w] [-t] [-h] <host> [<port>]\n\n"
+				"Options:\n"
+				"  -w   WebSock protocol\n"
+				"  -t   TELNET protocol\n"
+				"  -h   display help\n\n"
+				"Notes:\n"
+				"  The TELNET protocol is the default if none is specified.\n"
+				"  WebSock connects to port 4747 by default, and TELNET\n"
+				"  connects to port 23 by default.  CLC is 8-bit clean by\n"
+				"  default in TELNET mode, and supports UTF-8 if both the\n"
+				"  terminal and server support it.\n"
+			);
+			return 0;
+		}
+
 		/* other unknown option */
 		if (argv[i][0] == '-') {
-			fprintf(stderr, "Unknown option %s\n", argv[i]);
+			fprintf(stderr, "Unknown option %s.\nUse -h to see available options.\n", argv[i]);
 			exit(1);
 		}
 
@@ -562,7 +590,7 @@ int main (int argc, char** argv) {
 
 	/* ensure we have a host */
 	if (host == NULL) {
-		fprintf(stderr, "No host was given\n");
+		fprintf(stderr, "No host was given.\nUse -h to see command format.\n");
 		exit(1);
 	}
 
@@ -637,7 +665,6 @@ int main (int argc, char** argv) {
 	redraw_display();
 
 	/* set signal handlers */
-	struct sigaction sa;
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = handle_signal;
 	sigaction(SIGINT, &sa, NULL);
@@ -695,11 +722,13 @@ int main (int argc, char** argv) {
 			} else if (ret == 0) {
 				running = 0;
 			} else {
+				recv_bytes += ret;
 				protocol.on_recv(buffer, ret);
 			}
 		}
 
 		/* flush output */
+		paint_banner();
 		wnoutrefresh(win_main);
 		wnoutrefresh(win_banner);
 		wnoutrefresh(win_input);
@@ -707,7 +736,8 @@ int main (int argc, char** argv) {
 	}
 
 	/* final display, pause */
-	snprintf(banner, sizeof(banner), "CLC - %s:%s (disconnected)", host, port);
+	sock = -1;
+	paint_banner();
 	wnoutrefresh(win_banner);
 	doupdate();
 	wgetch(win_input);
@@ -752,6 +782,7 @@ static void websock_on_recv(const char* data, size_t len) {
 					break;
 				/* prompt */
 				case '>':
+					autobanner = 0;
 					snprintf(banner, sizeof(banner), "%.*s", (int)websock.msg_size - 1, &websock.msg[1]);
 					paint_banner();
 					break;
