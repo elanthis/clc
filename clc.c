@@ -737,6 +737,7 @@ int main (int argc, char** argv) {
 
 	/* final display, pause */
 	sock = -1;
+	autobanner = 1;
 	paint_banner();
 	wnoutrefresh(win_banner);
 	doupdate();
