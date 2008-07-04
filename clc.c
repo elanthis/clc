@@ -300,7 +300,7 @@ static void redraw_display (void) {
 	doupdate();
 }
 
-/* force-send bytes to websock server */
+/* force-send bytes to server */
 static void do_send (const char* bytes, size_t len) {
 	int ret;
 
