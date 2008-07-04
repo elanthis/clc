@@ -413,7 +413,7 @@ static void on_text_plain (const char* text, size_t len) {
 	size_t i;
 	for (i = 0; i < len; ++i) {
 		/* don't send ESC codes, for safety */
-		if (text[i] != 27)
+		if (text[i] != 27 && text[i] != '\r')
 			waddch(win_main, text[i]);
 	}
 }
@@ -428,7 +428,7 @@ static void on_text_ansi (const char* text, size_t len) {
 				if (text[i] == 27)
 					terminal.state = TERM_ESC;
 				/* just show it */
-				else
+				else if (text[i] != '\r')
 					waddch(win_main, text[i]);
 				break;
 			case TERM_ESC:
@@ -827,8 +827,8 @@ static void telnet_on_line (const char* line, size_t len) {
 	/* echo output */
 	if (terminal.flags & TERM_FLAG_ECHO) {
 		wattron(win_main, COLOR_PAIR(COLOR_YELLOW));
-		waddnstr(win_main, line, len);
-		waddch(win_main, '\n');
+		on_text_plain(line, len);
+		on_text_plain("\n", 1);
 		wattron(win_main, COLOR_PAIR(terminal.color));
 	}
 }
@@ -868,7 +868,7 @@ static void telnet_on_recv (const char* data, size_t len) {
 				else {
 					char buf[64];
 					snprintf(buf, sizeof(buf), "<IAC:%d>", (int)data[i]);
-					waddstr(win_main, buf);
+					on_text_plain(buf, strlen(buf));
 					telnet.state = TELNET_TEXT;
 				}
 				break;
