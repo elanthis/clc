@@ -44,6 +44,7 @@ static void telnet_on_resize(int w, int h);
 static void telnet_send_cmd(int cmd);
 static void telnet_send_opt(int type, int opt);
 static void telnet_send_esc(const char* bytes, size_t len);
+static void telnet_send_zmp(const char* cmd, ...);
 static void telnet_do_subreq(void);
 static void telnet_do_zmp(char* bytes, size_t len);
 
@@ -819,10 +820,20 @@ static void websock_on_resize (int w, int h) {
 
 /* send a line to the server */
 static void telnet_on_line (const char* line, size_t len) {
-	/* send with proper newline */
-	char nl[] = { '\n', '\r' };
-	telnet_send_esc(line, len);
-	telnet_send_esc(nl, sizeof(nl));
+	/* use zmp.input if ZMP is enabled */
+	if ((telnet.flags & TELNET_FLAG_ZMP) != 0) {
+		/* we need a buffer... for the NUL byte. */
+		char buf[EDITBUF_MAX+1];
+		snprintf(buf, sizeof(buf), "%.*s", (int)len, line);
+		telnet_send_zmp("zmp.input", buf, NULL);
+
+	/* regular way of sending line */
+	} else {
+		/* send with proper newline */
+		char nl[] = { '\n', '\r' };
+		telnet_send_esc(line, len);
+		telnet_send_esc(nl, sizeof(nl));
+	}
 
 	/* echo output */
 	if (terminal.flags & TERM_FLAG_ECHO) {
@@ -904,8 +915,10 @@ static void telnet_on_recv (const char* data, size_t len) {
 				break;
 			case TELNET_WONT:
 				/* turn on echo */
-				if ((unsigned char)data[i] == TELOPT_ECHO)
+				if ((unsigned char)data[i] == TELOPT_ECHO) {
 					terminal.flags |= TERM_FLAG_ECHO;
+					telnet_send_opt(DONT, TELOPT_ECHO);
+				}
 				telnet.state = TELNET_TEXT;
 				break;
 			case TELNET_SUB:
@@ -984,6 +997,25 @@ static void telnet_send_opt(int type, int opt) {
 	do_send(bytes, 3);
 }
 
+/* send a ZMP command */
+static void telnet_send_zmp(const char* cmd, ...) {
+	va_list va;
+	const char* str;
+
+	/* IAC SE ZMP, command (including NUL byte) */
+	telnet_send_opt(SB, 93);
+	telnet_send_esc(cmd, strlen(cmd) + 1);
+	
+	/* send arguments (including NUL byte after each) */
+	va_start(va, cmd);
+	while ((str = va_arg(va, const char*)) != NULL)
+		telnet_send_esc(str, strlen(str) + 1);
+	va_end(va);
+
+	/* IAC SE */
+	telnet_send_cmd(SE);
+}
+
 /* process telnet subrequest */
 static void telnet_do_subreq (void) {
 	/* must have at least one byte */
@@ -1028,11 +1060,8 @@ static void telnet_do_zmp (char* bytes, size_t len) {
 		time_t t;
 		time(&t);
 		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", gmtime(&t));
-		telnet_send_opt(SB, 93);
-		telnet_send_esc("zmp.time", 9); /* include NUL */
-		telnet_send_esc(buf, strlen(buf));
-		telnet_send_esc("", 1); /* trailing NUL */
-		telnet_send_cmd(SE);
+
+		telnet_send_zmp("zmp.time", buf, NULL);
 
 	/* zmp.time - just reports time (response to zmp.ping) */
 	} else if (strcmp(args[0], "zmp.time") == 0) {
