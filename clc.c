@@ -1023,7 +1023,7 @@ static void telnet_do_zmp (char* bytes, size_t len) {
 	/* deal with command */
 
 	/* zmp.ping - requests a time result */
-	if (strcmp(args[0], "zmp.ping")) {
+	if (strcmp(args[0], "zmp.ping") == 0) {
 		char buf[48];
 		time_t t;
 		time(&t);
@@ -1035,23 +1035,23 @@ static void telnet_do_zmp (char* bytes, size_t len) {
 		telnet_send_cmd(SE);
 
 	/* zmp.time - just reports time (response to zmp.ping) */
-	} else if (strcmp(args[0], "zmp.time")) {
+	} else if (strcmp(args[0], "zmp.time") == 0) {
 		/* do nothing */
 
 	/* zmp.ident - identifies server software */
-	} else if (strcmp(args[0], "zmp.ident")) {
+	} else if (strcmp(args[0], "zmp.ident") == 0) {
 		/* do nothing */
 
 	/* zmp.check - asks if pkg/cmd exists, return zmp.support
 	 * or zmp.no-support */
-	} else if (strcmp(args[0], "zmp.check")) {
+	} else if (strcmp(args[0], "zmp.check") == 0) {
 
 	/* zmp.support - response for zmp.check */
-	} else if (strcmp(args[0], "zmp.support")) {
+	} else if (strcmp(args[0], "zmp.support") == 0) {
 		/* do nothing */
 
 	/* zmp.no-support - response for zmp.check */
-	} else if (strcmp(args[0], "zmp.no-support")) {
+	} else if (strcmp(args[0], "zmp.no-support") == 0) {
 		/* do nothing */
 
 	/* something else entirely */
