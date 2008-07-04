@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/poll.h>
+#include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <arpa/telnet.h>
 #include <netinet/in.h>
@@ -16,7 +17,7 @@
 #include <errno.h>
 #include <string.h>
 #include <ctype.h>
-#include <termio.h>
+#include <time.h>
 #include <ncurses.h>
 
 /* telnet protocol */
@@ -44,6 +45,7 @@ static void telnet_send_cmd(int cmd);
 static void telnet_send_opt(int type, int opt);
 static void telnet_send_esc(const char* bytes, size_t len);
 static void telnet_do_subreq(void);
+static void telnet_do_zmp(char* bytes, size_t len);
 
 /* websock protocol */
 #define WEBSOCK_MAX_MSG 2048
@@ -1000,7 +1002,60 @@ static void telnet_do_subreq (void) {
 				return;
 
 			/* invoke ZMP */
-			/* on_zmp(&telnet.sub_buf[1], telnet.sub_size - 1); */
+			telnet_do_zmp(&telnet.sub_buf[1], telnet.sub_size - 1);
 			break;
+	}
+}
+
+/* do ZMP */
+static void telnet_do_zmp (char* bytes, size_t len) {
+	const size_t MAX_ARGS = 32;
+	char* args[MAX_ARGS];
+	char* c = bytes;
+	size_t i;
+
+	/* parse args */
+	for (i = 0; i < MAX_ARGS && c != bytes + len + 1; ++i) {
+		args[i] = c;
+		c += strlen(c) + 1;
+	}
+
+	/* deal with command */
+
+	/* zmp.ping - requests a time result */
+	if (strcmp(args[0], "zmp.ping")) {
+		char buf[48];
+		time_t t;
+		time(&t);
+		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", gmtime(&t));
+		telnet_send_opt(SB, 93);
+		telnet_send_esc("zmp.time", 9); /* include NUL */
+		telnet_send_esc(buf, strlen(buf));
+		telnet_send_esc("", 1); /* trailing NUL */
+		telnet_send_cmd(SE);
+
+	/* zmp.time - just reports time (response to zmp.ping) */
+	} else if (strcmp(args[0], "zmp.time")) {
+		/* do nothing */
+
+	/* zmp.ident - identifies server software */
+	} else if (strcmp(args[0], "zmp.ident")) {
+		/* do nothing */
+
+	/* zmp.check - asks if pkg/cmd exists, return zmp.support
+	 * or zmp.no-support */
+	} else if (strcmp(args[0], "zmp.check")) {
+
+	/* zmp.support - response for zmp.check */
+	} else if (strcmp(args[0], "zmp.support")) {
+		/* do nothing */
+
+	/* zmp.no-support - response for zmp.check */
+	} else if (strcmp(args[0], "zmp.no-support")) {
+		/* do nothing */
+
+	/* something else entirely */
+	} else {
+		/* do nothing */
 	}
 }
