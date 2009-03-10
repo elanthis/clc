@@ -48,30 +48,14 @@ static void telnet_send_zmp(const char* cmd, ...);
 static void telnet_do_subreq(void);
 static void telnet_do_zmp(char* bytes, size_t len);
 
-/* websock protocol */
-#define WEBSOCK_MAX_MSG 2048
+/* zmp commands */
 
-static struct WEBSOCK {
-	char msg[WEBSOCK_MAX_MSG];
-	size_t msg_size;
-} websock;
+struct ZMP {
+	const char* name;
+	void (*cb)(size_t argc, char* argv[]);
+};
 
-static void websock_on_line(const char* line, size_t len);
-static void websock_on_recv(const char* bytes, size_t len);
-static void websock_on_resize(int w, int h);
-
-/* protocol handler */
-typedef enum { PROTOCOL_TELNET, PROTOCOL_WEBSOCK } protocol_type_t;
-
-static struct PROTOCOL {
-	protocol_type_t type;
-
-	void (*on_line)(const char* line, size_t len);
-	void (*on_recv)(const char* bytes, size_t len);
-	void (*on_resize)(int w, int h);
-} protocol;
-
-static void protocol_init(protocol_type_t type);
+static struct ZMP zmp_registry[];
 
 /* terminal processing */
 typedef enum { TERM_ASCII, TERM_ESC, TERM_ESCRUN } term_state_t;
@@ -285,10 +269,10 @@ static void redraw_display (void) {
 	/* update */
 	paint_banner();
 
-	/* update size on protocol */
+	/* update size */
 	if (running) {
 		unsigned short w = htons(COLS), h = htons(LINES);
-		protocol.on_resize(w, h);
+		telnet_on_resize(w, h);
 	}
 
 	/* input display */
@@ -334,7 +318,7 @@ static void on_key (int key) {
 		/* send */
 		if (key == KEY_ENTER) {
 			/* send line to server */
-			protocol.on_line(editbuf.buf, editbuf.size);
+			telnet_on_line(editbuf.buf, editbuf.size);
 			/* reset input */
 			editbuf_set("");
 		}
@@ -366,7 +350,7 @@ static void on_key (int key) {
 		/* send */
 		if (key == '\n' || key == '\r') {
 			/* send line to server */
-			protocol.on_line(editbuf.buf, editbuf.size);
+			telnet_on_line(editbuf.buf, editbuf.size);
 			/* reset input */
 			editbuf_set("");
 
@@ -468,21 +452,6 @@ static void on_text_ansi (const char* text, size_t len) {
 	}
 }
 
-/* initialize the protocol */
-static void protocol_init (protocol_type_t type) {
-	protocol.type = type;
-
-	if (type == PROTOCOL_TELNET) {
-		protocol.on_line = telnet_on_line;
-		protocol.on_recv = telnet_on_recv;
-		protocol.on_resize = telnet_on_resize;
-	} else if (type == PROTOCOL_WEBSOCK) {
-		protocol.on_line = websock_on_line;
-		protocol.on_recv = websock_on_recv;
-		protocol.on_resize = websock_on_resize;
-	}
-}
-
 /* attempt to connect to the requested hostname on the request port */
 static int do_connect (const char* host, const char* port) {
 	struct addrinfo hints;
@@ -526,52 +495,21 @@ static int do_connect (const char* host, const char* port) {
 }
 
 int main (int argc, char** argv) {
-	protocol_type_t type = PROTOCOL_TELNET;
 	const char* default_port = "23";
 	struct sigaction sa;
 	int i;
 
-	/* process command line args
-	 *
-	 * usage:
-	 *  client [options] <host> [<port>]
-	 * 
-	 * options:
-	 *  -t  use telnet (port 23)
-	 *  -w  use websock (port 4747)
-	 */
+	/* process command line args */
 	for (i = 1; i < argc; ++i) {
-		/* set protocol to telnet */
-		if (strcmp(argv[i], "-t") == 0) {
-			type = PROTOCOL_TELNET;
-			default_port = "23";
-			continue;
-		}
-
-		/* set protocol to websock */
-		if (strcmp(argv[i], "-w") == 0) {
-			type = PROTOCOL_WEBSOCK;
-			default_port = "4747";
-			continue;
-		}
-
 		/* help */
 		if (strcmp(argv[i], "-h") == 0) {
 			printf(
 				"CLC by Sean Middleditch <elanthis@sourcemud.org>\n"
 				"This program has been released into the PUBLIC DOMAIN.\n\n"
 				"Usage:\n"
-				"  clc [-w] [-t] [-h] <host> [<port>]\n\n"
+				"  clc [-h] <host> [<port>]\n\n"
 				"Options:\n"
-				"  -w   WebSock protocol\n"
-				"  -t   TELNET protocol\n"
-				"  -h   display help\n\n"
-				"Notes:\n"
-				"  The TELNET protocol is the default if none is specified.\n"
-				"  WebSock connects to port 4747 by default, and TELNET\n"
-				"  connects to port 23 by default.  CLC is 8-bit clean by\n"
-				"  default in TELNET mode, and supports UTF-8 if both the\n"
-				"  terminal and server support it.\n"
+				"  -h   display help\n"
 			);
 			return 0;
 		}
@@ -610,12 +548,8 @@ int main (int argc, char** argv) {
 	terminal.flags = TERM_FLAGS_DEFAULT;
 	terminal.color = TERM_COLOR_DEFAULT;
 
-	/* initial websock and telnet handlers */
+	/* initial telnet handler */
 	memset(&telnet, 0, sizeof(struct TELNET));
-	memset(&websock, 0, sizeof(struct WEBSOCK));
-
-	/* configure protocol */
-	protocol_init(type);
 
 	/* connect to server */
 	sock = do_connect(host, port);
@@ -712,7 +646,7 @@ int main (int argc, char** argv) {
 				on_key(key);
 		}
 
-		/* websock data */
+		/* process input data */
 		if (fds[1].revents & POLLIN) {
 			char buffer[2048];
 			int ret = recv(sock, buffer, sizeof(buffer), 0);
@@ -726,7 +660,7 @@ int main (int argc, char** argv) {
 				running = 0;
 			} else {
 				recv_bytes += ret;
-				protocol.on_recv(buffer, ret);
+				telnet_on_recv(buffer, ret);
 			}
 		}
 
@@ -751,69 +685,6 @@ int main (int argc, char** argv) {
 	printf("Disconnected.\n");
 
 	return 0;
-}
-
-/* ======= WEBSOCK ======= */
-
-/* send a command line to the server */
-static void websock_on_line (const char* line, size_t len) {
-	char cmd = '=';
-	char nul = 0;
-
-	/* send =(line)NUL */
-	do_send(&cmd, 1);
-	do_send(line, len);
-	do_send(&nul, 1);
-}
-
-/* process input from websock */
-static void websock_on_recv(const char* data, size_t len) {
-	size_t i;
-	for (i = 0; i < len; ++i) {
-		if (data[i] != 0) {
-			/* don't allow overflow */
-			if (websock.msg_size == WEBSOCK_MAX_MSG) {
-				/* ignore FIXME */
-			} else {
-				websock.msg[websock.msg_size++] = data[i];
-			}
-		} else {
-			/* process the message */
-			switch (websock.msg[0]) {
-				/* text */
-				case '"':
-					on_text_plain(&websock.msg[1], websock.msg_size - 1);
-					break;
-				/* prompt */
-				case '>':
-					autobanner = 0;
-					snprintf(banner, sizeof(banner), "%.*s", (int)websock.msg_size - 1, &websock.msg[1]);
-					paint_banner();
-					break;
-				/* clear screen */
-				case 'C':
-					wclear(win_main);
-					break;
-				/* password mode */
-				case 'p':
-					/* data must be 1 for on, 0 for off, else no effect */
-					if (websock.msg_size == 2 && websock.msg[1] == '1')
-						terminal.flags &= ~TERM_FLAG_ECHO;
-					else if (websock.msg_size == 2 && websock.msg[1] == '0')
-						terminal.flags |= TERM_FLAG_ECHO;
-					break;
-			}
-
-			/* reset buffer */
-			websock.msg[0] = 0;
-			websock.msg_size = 0;
-		}
-	}
-}
-
-/* websock has no sizing commands; ignore */
-static void websock_on_resize (int w, int h) {
-	/* do nothing */
 }
 
 /* ======= TELNET ======= */
@@ -891,7 +762,7 @@ static void telnet_on_recv (const char* data, size_t len) {
 						telnet.flags |= TELNET_FLAG_NAWS;
 						telnet_send_opt(WILL, TELOPT_NAWS);
 						unsigned short w = htons(COLS), h = htons(LINES);
-						protocol.on_resize(w, h);
+						telnet_on_resize(w, h);
 						break;
 					}
 				}
@@ -1042,49 +913,87 @@ static void telnet_do_subreq (void) {
 /* do ZMP */
 static void telnet_do_zmp (char* bytes, size_t len) {
 	const size_t MAX_ARGS = 32;
-	char* args[MAX_ARGS];
+	char* argv[MAX_ARGS];
 	char* c = bytes;
-	size_t i;
+	size_t argc;
+	int i;
 
 	/* parse args */
-	for (i = 0; i < MAX_ARGS && c != bytes + len + 1; ++i) {
-		args[i] = c;
+	for (argc = 0; argc < MAX_ARGS && c != bytes + len + 1; ++argc) {
+		argv[argc] = c;
 		c += strlen(c) + 1;
 	}
 
 	/* deal with command */
-
-	/* zmp.ping - requests a time result */
-	if (strcmp(args[0], "zmp.ping") == 0) {
-		char buf[48];
-		time_t t;
-		time(&t);
-		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", gmtime(&t));
-
-		telnet_send_zmp("zmp.time", buf, NULL);
-
-	/* zmp.time - just reports time (response to zmp.ping) */
-	} else if (strcmp(args[0], "zmp.time") == 0) {
-		/* do nothing */
-
-	/* zmp.ident - identifies server software */
-	} else if (strcmp(args[0], "zmp.ident") == 0) {
-		/* do nothing */
-
-	/* zmp.check - asks if pkg/cmd exists, return zmp.support
-	 * or zmp.no-support */
-	} else if (strcmp(args[0], "zmp.check") == 0) {
-
-	/* zmp.support - response for zmp.check */
-	} else if (strcmp(args[0], "zmp.support") == 0) {
-		/* do nothing */
-
-	/* zmp.no-support - response for zmp.check */
-	} else if (strcmp(args[0], "zmp.no-support") == 0) {
-		/* do nothing */
-
-	/* something else entirely */
-	} else {
-		/* do nothing */
+	for (i = 0; zmp_registry[i].name != NULL; ++i) {
+		if (strcmp(argv[i], zmp_registry[i].name) == 0) {
+			zmp_registry[i].cb(argc, argv);
+			break;
+		}
 	}
+}
+
+/* ======= ZMP ======= */
+
+static void zmp_ping (size_t argc, char* argv[]);
+static void zmp_check (size_t argc, char* argv[]);
+
+static void zmp_noimpl (size_t argc, char* argv[]);
+
+static struct ZMP zmp_registry[] = {
+	{ "zmp.ping", zmp_ping },
+	{ "zmp.time", zmp_noimpl },
+	{ "zmp.ident", zmp_noimpl },
+	{ "zmp.check", zmp_check },
+	{ "zmp.support", zmp_noimpl },
+	{ "zmp.no-support", zmp_noimpl },
+	{ NULL, NULL }
+};
+
+/* zmp.ping - requests a time result */
+void zmp_ping (size_t argc, char* argv[]) {
+	char buf[48];
+	time_t t;
+	time(&t);
+	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", gmtime(&t));
+
+	telnet_send_zmp("zmp.time", buf, NULL);
+}
+
+/* zmp.check - asks if pkg/cmd exists, return zmp.support or zmp.no-support */
+void zmp_check (size_t argc, char* argv[]) {
+	int pkg = 0;
+	int i;
+
+	/* check arguments */
+	if (argc != 2)
+		return;
+	if (argv[1][0] == '\0')
+		return;
+
+	/* are we looking for a package instead of a command? */
+	if (argv[2][strlen(argv[1]) - 1] == '.')
+		pkg = 1;
+
+	/* search registry */
+	for (i = 0; zmp_registry[i].name != NULL; ++i) {
+		/* found a matching command? */
+		if (pkg == 0 && strcmp(argv[1], zmp_registry[i].name) == 0) {
+			telnet_send_zmp("zmp.support", argv[1], NULL);
+			return;
+		/* found a matching package? */
+		} else if (pkg == 1 && strncmp(argv[1], zmp_registry[i].name,
+				strlen(argv[1])) == 0) {
+			telnet_send_zmp("zmp.support", argv[1], NULL);
+			return;
+		}
+	}
+
+	/* found nothing */
+	telnet_send_zmp("zmp.no-support", argv[1], NULL);
+}
+
+/* no implementation -- stub for commands that need no processing code */
+void zmp_noimpl (size_t argc, char* argv[]) {
+	/* do nothing */
 }
