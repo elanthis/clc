@@ -1,7 +1,12 @@
+LIBTELNET = ../libtelnet
+
+CFLAGS = -Wall -g -I$(LIBTELNET) -DHAVE_ZLIB
+LFLAGS = -lcurses -L$(LIBTELNET) -ltelnet -lz
+
 all: clc
 
 clc: clc.c
-	$(CC) -Wall -g -o clc clc.c -lcurses
+	$(CC) $(CFLAGS) -o clc clc.c $(LFLAGS)
 
 dist: clc-dist.tar.gz
 
