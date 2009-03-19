@@ -5,7 +5,7 @@ LFLAGS = -lcurses -L$(LIBTELNET) -ltelnet -lz
 
 all: clc
 
-clc: clc.c
+clc: clc.c $(LIBTELNET)/libtelnet.a
 	$(CC) $(CFLAGS) -o clc clc.c $(LFLAGS)
 
 dist: clc-dist.tar.gz
