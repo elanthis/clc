@@ -691,6 +691,11 @@ static void telnet_event (telnet_t* telnet, telnet_event_t* ev, void* ud) {
 		if (ev->telopt == TELNET_TELOPT_ECHO) {
 			ev->accept = 1;
 			terminal.flags &= ~TERM_FLAG_ECHO;
+		} else if (ev->telopt == TELNET_TELOPT_COMPRESS2) {
+			ev->accept = 1;
+		} else if (ev->telopt == TELNET_TELOPT_ZMP) {
+			ev->accept = 1;
+			terminal.flags |= TERM_FLAG_ZMP;
 		}
 		break;
 	case TELNET_EV_WONT:
@@ -698,12 +703,7 @@ static void telnet_event (telnet_t* telnet, telnet_event_t* ev, void* ud) {
 			terminal.flags |= TERM_FLAG_ECHO;
 		break;
 	case TELNET_EV_DO:
-		if (ev->telopt == TELNET_TELOPT_COMPRESS2)
-			ev->accept = 1;
-		else if (ev->telopt == TELNET_TELOPT_ZMP) {
-			ev->accept = 1;
-			terminal.flags |= TERM_FLAG_ZMP;
-		} else if (ev->telopt == TELNET_TELOPT_NAWS) {
+		if (ev->telopt == TELNET_TELOPT_NAWS) {
 			ev->accept = 1;
 			terminal.flags |= TERM_FLAG_NAWS;
 		}
@@ -724,20 +724,7 @@ static void telnet_event (telnet_t* telnet, telnet_event_t* ev, void* ud) {
 	
 /* send a line to the server */
 static void send_line (const char* line, size_t len) {
-	/* use zmp.input if ZMP is enabled */
-	if ((terminal.flags & TERM_FLAG_ZMP) != 0) {
-		/* we need a buffer... for the NUL byte. */
-		char buf[EDITBUF_MAX+1];
-		snprintf(buf, sizeof(buf), "%.*s", (int)len, line);
-		send_zmp("zmp.input", buf, NULL);
-
-	/* regular way of sending line */
-	} else {
-		/* send with proper newline */
-		char nl[] = { '\n', '\r' };
-		telnet_send_data(&telnet, line, len);
-		telnet_send_data(&telnet, nl, 2);
-	}
+	telnet_printf(&telnet, "%.*s\n", len, line);
 
 	/* echo output */
 	if (terminal.flags & TERM_FLAG_ECHO) {
@@ -786,8 +773,12 @@ static void do_zmp (const char* bytes, size_t len) {
 	size_t argc;
 	int i;
 
+	/* ensure not empty and that final byte is a NUL byte */
+	if (len == 0 || bytes[len - 1] != 0)
+		return;
+
 	/* parse args */
-	for (argc = 0; argc < MAX_ARGS && c != bytes + len + 1; ++argc) {
+	for (argc = 0; argc < MAX_ARGS; ++argc) {
 		argv[argc] = c;
 		c += strlen(c) + 1;
 	}
