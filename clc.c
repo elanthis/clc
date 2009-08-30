@@ -498,12 +498,12 @@ int main (int argc, char** argv) {
 		/* help */
 		if (strcmp(argv[i], "-h") == 0) {
 			printf(
-				"CLC by Sean Middleditch <elanthis@sourcemud.org>\n"
+				"CLC %s by Sean Middleditch <elanthis@sourcemud.org>\n"
 				"This program has been released into the PUBLIC DOMAIN.\n\n"
 				"Usage:\n"
 				"  clc [-h] <host> [<port>]\n\n"
 				"Options:\n"
-				"  -h   display help\n"
+				"  -h   display help\n", CLC_VERSION
 			);
 			return 0;
 		}
