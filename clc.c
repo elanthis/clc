@@ -27,7 +27,7 @@
 #include "libtelnet.h"
 
 /* telnet protocol */
-static telnet_t telnet;
+static telnet_t *telnet;
 
 static const telnet_telopt_t telnet_telopts[] = {
 	{ TELNET_TELOPT_ECHO, 		TELNET_WONT, TELNET_DO   },
@@ -543,7 +543,7 @@ int main (int argc, char** argv) {
 	terminal.color = TERM_COLOR_DEFAULT;
 
 	/* initial telnet handler */
-	telnet_init(&telnet, telnet_telopts, telnet_event, 0, 0);
+	telnet = telnet_init(telnet_telopts, telnet_event, 0, 0);
 
 	/* connect to server */
 	sock = do_connect(host, port);
@@ -654,7 +654,7 @@ int main (int argc, char** argv) {
 				running = 0;
 			} else {
 				recv_bytes += ret;
-				telnet_recv(&telnet, buffer, ret);
+				telnet_recv(telnet, buffer, ret);
 			}
 		}
 
@@ -677,6 +677,9 @@ int main (int argc, char** argv) {
 	/* clean up */
 	endwin();
 	printf("Disconnected.\n");
+
+	/* free memory (so Valgrind leak detection is useful) */
+	telnet_free(telnet);
 
 	return 0;
 }
@@ -737,7 +740,7 @@ static void telnet_event (telnet_t* telnet, telnet_event_t* ev, void* ud) {
 	
 /* send a line to the server */
 static void send_line (const char* line, size_t len) {
-	telnet_printf(&telnet, "%.*s\n", (int)len, line);
+	telnet_printf(telnet, "%.*s\n", (int)len, line);
 
 	/* echo output */
 	if (terminal.flags & TERM_FLAG_ECHO) {
@@ -754,10 +757,10 @@ static void send_naws (void) {
 
 	/* send NAWS if enabled */
 	if (terminal.flags & TERM_FLAG_NAWS) {
-		telnet_begin_sb(&telnet, TELOPT_NAWS);
-		telnet_send(&telnet, (char*)&w, 2);
-		telnet_send(&telnet, (char*)&h, 2);
-		telnet_finish_sb(&telnet);
+		telnet_begin_sb(telnet, TELOPT_NAWS);
+		telnet_send(telnet, (char*)&w, 2);
+		telnet_send(telnet, (char*)&h, 2);
+		telnet_finish_sb(telnet);
 	}
 }
 
@@ -798,7 +801,7 @@ void zmp_ping (size_t argc, const char* argv[]) {
 	time(&t);
 	strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", gmtime(&t));
 
-	telnet_send_zmpv(&telnet, "zmp.time", buf, NULL);
+	telnet_send_zmpv(telnet, "zmp.time", buf, NULL);
 }
 
 /* zmp.check - asks if pkg/cmd exists, return zmp.support or zmp.no-support */
@@ -820,18 +823,18 @@ void zmp_check (size_t argc, const char* argv[]) {
 	for (i = 0; zmp_registry[i].name != NULL; ++i) {
 		/* found a matching command? */
 		if (pkg == 0 && strcmp(argv[1], zmp_registry[i].name) == 0) {
-			telnet_send_zmpv(&telnet, "zmp.support", argv[1], NULL);
+			telnet_send_zmpv(telnet, "zmp.support", argv[1], NULL);
 			return;
 		/* found a matching package? */
 		} else if (pkg == 1 && strncmp(argv[1], zmp_registry[i].name,
 				strlen(argv[1])) == 0) {
-			telnet_send_zmpv(&telnet, "zmp.support", argv[1], NULL);
+			telnet_send_zmpv(telnet, "zmp.support", argv[1], NULL);
 			return;
 		}
 	}
 
 	/* found nothing */
-	telnet_send_zmpv(&telnet, "zmp.no-support", argv[1], NULL);
+	telnet_send_zmpv(telnet, "zmp.no-support", argv[1], NULL);
 }
 
 /* no implementation -- stub for commands that need no processing code */
