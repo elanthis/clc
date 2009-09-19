@@ -1,15 +1,23 @@
-VERSION = 0.01
+VERSION = 0.02
 
-CFLAGS = -Wall -g -DHAVE_ZLIB -DCLC_VERSION='"$(VERSION)"'
-LFLAGS = -lcurses -ltelnet -lz
+CFLAGS := -Wall -g -O0
+LFLAGS :=
+
+LIBTELNET_CFLAGS := $(shell pkg-config libtelnet --cflags)
+LIBTELNET_LFLAGS := $(shell pkg-config libtelnet --libs)
+
+CURSES_CFLAGS :=
+CURSES_LFLAGS := -lcurses
+
+CLC_CONFIG := -DCLC_VERSION='"$(VERSION)"'
 
 all: clc
 
 clc.o: clc.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CLC_CONFIG) $(LIBTELNET_CFLAGS) $(CURSES_CFLAGS) $(CFLAGS) -c -o $@ $<
 
 clc: clc.o
-	$(CC) -o $@ $< $(LFLAGS)
+	$(CC) -o $@ $< $(LIBTELNET_LFLAGS) $(CURSES_LFLAGS) $(LFLAGS)
 
 dist: clc-$(VERSION).tar.gz
 
