@@ -690,51 +690,45 @@ int main (int argc, char** argv) {
 static void telnet_event (telnet_t* telnet, telnet_event_t* ev, void* ud) {
 	switch (ev->type) {
 	case TELNET_EV_DATA:
-		on_text_ansi(ev->buffer, ev->size);
+		on_text_ansi(ev->data.buffer, ev->data.size);
 		break;
 	case TELNET_EV_SEND:
-		do_send(ev->buffer, ev->size);
-		break;
-	case TELNET_EV_IAC:
+		do_send(ev->data.buffer, ev->data.size);
 		break;
 	case TELNET_EV_WILL:
-		if (ev->telopt == TELNET_TELOPT_ECHO)
+		if (ev->neg.telopt == TELNET_TELOPT_ECHO)
 			terminal.flags &= ~TERM_FLAG_ECHO;
-		else if (ev->telopt == TELNET_TELOPT_ZMP) {
+		else if (ev->neg.telopt == TELNET_TELOPT_ZMP) {
 			terminal.flags |= TERM_FLAG_ZMP;
 			telnet_send_zmpv(telnet, "zmp.ident", "clc", "n/a", "simple command-line client", NULL);
 		}
 		break;
 	case TELNET_EV_WONT:
-		if (ev->telopt == TELNET_TELOPT_ECHO)
+		if (ev->neg.telopt == TELNET_TELOPT_ECHO)
 			terminal.flags |= TERM_FLAG_ECHO;
 		break;
 	case TELNET_EV_DO:
-		if (ev->telopt == TELNET_TELOPT_NAWS) {
+		if (ev->neg.telopt == TELNET_TELOPT_NAWS) {
 			terminal.flags |= TERM_FLAG_NAWS;
 			send_naws();
 		}
 		break;
-	case TELNET_EV_DONT:
-		break;
-	case TELNET_EV_SUBNEGOTIATION:
-		/* process ZMP commands */
-		if (ev->telopt == TELNET_TELOPT_ZMP && ev->argc != 0)
-			do_zmp(ev->argc, ev->argv);
-		break;
-	case TELNET_EV_COMPRESS:
+	case TELNET_EV_ZMP:
+		do_zmp(ev->zmp.argc, ev->zmp.argv);
 		break;
 	case TELNET_EV_WARNING:
 		wattron(win_main, COLOR_PAIR(COLOR_RED));
 		on_text_plain("\nWARNING:", 8);
-		on_text_plain(ev->buffer, ev->size);
+		on_text_plain(ev->error.msg, strlen(ev->error.msg));
 		on_text_plain("\n", 1);
 		wattron(win_main, COLOR_PAIR(terminal.color));
 		break;
 	case TELNET_EV_ERROR:
 		endwin();
-		fprintf(stderr, "TELNET error: %s\n", ev->buffer);
+		fprintf(stderr, "TELNET error: %s\n", ev->error.msg);
 		exit(1);
+	default:
+		break;
 	}
 }
 	
