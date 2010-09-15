@@ -1,4 +1,4 @@
-VERSION = 0.02
+VERSION = 0.03
 
 CFLAGS := -Wall -g -O0
 LFLAGS :=
